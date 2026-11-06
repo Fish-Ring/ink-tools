@@ -1,0 +1,96 @@
+name: build-apk
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 不再用 android-actions/setup-android：新版 runner 的 cmdline-tools 16
+      # 已经没有 "tools" 包，那个 action 一跑就报「未找到包 tools」直接失败。
+      # 镜像本身自带 SDK，缺什么就用自带的 sdkmanager 补。
+      - name: 准备 Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID SDK = $SDK"
+          if [ ! -x "$SDK/build-tools/34.0.0/aapt2" ] || [ ! -f "$SDK/platforms/android-34/android.jar" ]; then
+            SM=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)
+            if [ -z "$SM" ]; then echo "找不到 sdkmanager"; exit 1; fi
+            echo "用 $SM 安装缺失组件"
+            yes | "$SM" --licenses > /dev/null 2>&1 || true
+            "$SM" "platforms;android-34" "build-tools;34.0.0"
+          fi
+          echo "build-tools:"; ls "$SDK/build-tools"
+          echo "platforms:"; ls "$SDK/platforms"
+
+      # 签名私钥只从仓库机密读取，不落仓库（公开仓库里放 keystore 等于把签名公开）。
+      # 没配 KEYSTORE_B64 也能构建，但签出来的是临时密钥，无法覆盖安装已装版本。
+      - name: 签名
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          rm -f debug.keystore
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > debug.keystore 2>/dev/null || true
+          fi
+          if keytool -list -keystore debug.keystore -storepass android > /dev/null 2>&1; then
+            echo "签名就绪（与本地包可互相覆盖安装）"
+          else
+            rm -f debug.keystore
+            echo "::warning::未配置 Secret KEYSTORE_B64，本次用临时签名，不能覆盖安装"
+          fi
+
+      - name: 编译
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 重命名产物
+        run: |
+          V=$(grep -oP 'versionName="\K[^"]+' AndroidManifest.xml)
+          cp eink-toolbox.apk "eink-toolbox-v$V.apk"
+          echo "APK=eink-toolbox-v$V.apk" >> "$GITHUB_ENV"
+          echo "版本 $V" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ink-tools-apk
+          path: ${{ env.APK }}
+          if-no-files-found: error
+
+      # 推到 main 且版本号是新的，就直接发 Release（tag 由 gh 自动建）。
+      # 这样每次改完 versionName 推上去，Release 里就有固定下载链接，不用手动打 tag。
+      - name: 发 Release（同版本已存在则跳过）
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(grep -oP 'versionName="\K[^"]+' AndroidManifest.xml)
+          if gh release view "v$V" > /dev/null 2>&1; then
+            echo "v$V 已存在，只更新文件"
+            gh release upload "v$V" "$APK" --clobber
+          else
+            gh release create "v$V" "$APK" \
+              --title "Ink Tools v$V" \
+              --notes "由 GitHub Actions 自动构建 · commit $GITHUB_SHA"
+          fi
+
+      - name: 附到 Release（打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.APK }}
