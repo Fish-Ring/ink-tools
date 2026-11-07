@@ -7,11 +7,13 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.DialogInterface;
+import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -61,23 +63,76 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void hideBars() {
+    /**
+     * 全屏显示，同时把窗口、状态栏、导航栏都染成页面底色。
+     *
+     * 以前只做了「隐藏系统栏」，可主题默认的窗口底色是黑的——
+     * 一旦状态栏藏不住（部分国产 ROM 强制常驻），或者下拉时被临时拉出，
+     * 露出来的就是那条黑边。现在底色跟页面一致，系统图标转成深色，
+     * 藏得住是纯白全屏，藏不住也是白底黑图标，两种情况都不会出现黑条。
+     */
+    public void hideBars() {
+        Window w = getWindow();
+        // OLED 模式整屏反色，窗口与系统栏要跟着一起黑，否则四周会露白边
+        int bg = store.oled ? 0xFF000000 : 0xFFFFFFFF;
+        w.setBackgroundDrawable(new ColorDrawable(bg));
+        if (Build.VERSION.SDK_INT >= 21) {
+            w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+            w.setStatusBarColor(bg);
+            w.setNavigationBarColor(bg);
+        }
         if (Build.VERSION.SDK_INT >= 30) {
-            getWindow().setDecorFitsSystemWindows(false);
-            WindowInsetsController c = getWindow().getInsetsController();
+            w.setDecorFitsSystemWindows(false);
+            WindowInsetsController c = w.getInsetsController();
             if (c != null) {
+                // 深色底用浅色图标，白底用深色图标
+                int light = store.oled ? 0
+                        : (WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+                c.setSystemBarsAppearance(light, WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
                 c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
                 c.setSystemBarsBehavior(
                         WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            getWindow().getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            int f = View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+            if (!store.oled) {
+                if (Build.VERSION.SDK_INT >= 23) f |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                if (Build.VERSION.SDK_INT >= 26) f |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            }
+            w.getDecorView().setSystemUiVisibility(f);
         }
+    }
+
+    /** 电量统计：一个弹窗，三条口径（今日 / 本次充电后 / 近 7 天）轮流看。 */
+    public void battDialog() {
+        final int[] at = {0};
+        final AlertDialog[] dlg = new AlertDialog[1];
+        dlg[0] = new AlertDialog.Builder(this)
+                .setTitle("电量统计　1/3")
+                .setMessage(screen.battPage(0))
+                .setNegativeButton("关闭", null)
+                .setPositiveButton("下一个 ›", null)
+                .create();
+        dlg[0].setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface d) {
+                // 把「下一个」换成不关闭对话框的点击，三条口径原地切换
+                dlg[0].getButton(AlertDialog.BUTTON_POSITIVE)
+                        .setOnClickListener(new View.OnClickListener() {
+                            @Override public void onClick(View v) {
+                                at[0] = (at[0] + 1) % 3;
+                                dlg[0].setTitle("电量统计　" + (at[0] + 1) + "/3");
+                                dlg[0].setMessage(screen.battPage(at[0]));
+                            }
+                        });
+            }
+        });
+        dlg[0].show();
     }
 
     public void toast(String s) {

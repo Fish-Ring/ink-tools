@@ -71,26 +71,36 @@ public final class Store {
     private long pomoDoneDay;
     private int habitMonth;                   // yyyyMM，用于跨月清空打卡格
 
-    // 电量统计：只记「今天第一次采样时的电量」，跨天自动重来。
-    // 不碰任何系统统计接口——零权限能拿到的原始数据只有百分比，够用就行。
-    public int battStartPct = -1;
-    public long battStartAt = 0, battDay = 0;
-    public boolean battCharging = false;
-
+    // ---------------------------------------------------------------- 电量统计
     /**
-     * 电量明细的一个采样点。
-     * fg 表示「从这个点起是否在前台」：退出时记一个 fg=false 的点，
-     * 回来时记一个 fg=true 的点，中间那段就是「离开期间」，能和「使用中」分开算。
+     * 一个统计口径的累加器。只存「当前这一次」，不留历史明细。
+     *
+     * start 是这一轮从几点起算，last 是上一次采样时刻，pct 是上一次采样到的电量，
+     * ms / drop 是累计的「有效使用时长」和「有效掉电」。
+     *
+     * 累计只在两次采样间隔不超过 BATT_GAP 时进行：超过就判定中间离开了，
+     * 时长与掉电都不加，只把 last / pct 挪到当前。挪 pct 这一步最关键——
+     * 离开一晚掉了 20%，若不挪，回来第一分钟就会把这 20% 算成消耗。
      */
-    public static final class BattPoint {
-        public long at;
-        public int pct;
-        public boolean fg;
-        BattPoint(long a, int p, boolean f) { at = a; pct = p; fg = f; }
+    public static final class BattAcc {
+        public long day;                 // 归档日桶用：yyyyMMdd
+        public long start, last;
+        public int pct = -1;
+        public int from = -1;            // 起点电量，用于「90% → 87%」这种展示
+        public long ms;
+        public int drop;
     }
 
-    /** 最近 7 天的采样点，按时间正序；只在电量 / 前后台变化时追加。 */
-    public final ArrayList<BattPoint> battLog = new ArrayList<>();
+    /** 两次采样间隔超过这个值就算离开。tick 对齐整分钟，正常间隔 60.02 秒，留足抖动余量。 */
+    public static final long BATT_GAP = 100000L;
+
+    public BattAcc battToday = new BattAcc();      // 今天
+    public BattAcc battCharge = new BattAcc();     // 本次充电后（拔电起算）
+    public final ArrayList<BattAcc> battArch = new ArrayList<>();   // 归档日桶，最多 6 条
+    public boolean battCharging = false;
+    private long battDay;                          // 今日累加器属于哪一天
+    private long battSavedAt;
+    private boolean battSeeded;
 
     public Store(Context c) {
         p = c.getSharedPreferences("eink", Context.MODE_PRIVATE);
@@ -109,12 +119,13 @@ public final class Store {
         pomoDoneToday = p.getInt("pd", 0);
         pomoDoneDay = p.getLong("pdd", 0);
         habitMonth = p.getInt("hm", 0);
-        battStartPct = p.getInt("btp", -1);
-        battStartAt = p.getLong("bta", 0);
-        battDay = p.getLong("btd", 0);
-        battCharging = p.getBoolean("btc", false);
         loadPomoHist(p.getString("ph", ""));
-        loadBattLog(p.getString("btl", ""));
+        loadBatt(p.getString("bt1", ""), p.getString("bt2", ""), p.getString("bt7", ""),
+                p.getLong("btd", 0), p.getBoolean("btc", false), p.getBoolean("bts", false));
+        // 旧版本的采样点数组已不再使用，顺手清掉，别白占空间
+        if (p.contains("btl") || p.contains("btp") || p.contains("bta")) {
+            p.edit().remove("btl").remove("btp").remove("bta").apply();
+        }
         pomoAllRounds = p.getInt("par", 0);
         pomoAllMinutes = p.getInt("pam", 0);
         if (pomoAllRounds == 0 && !pomoHist.isEmpty()) {
@@ -685,112 +696,166 @@ public final class Store {
     }
 
     /**
-     * 采样一次电量，维护「本次使用」的起点。
+     * 每分钟跟着 tick 采一次，start / stop 也各调一次，把前后台边界对齐。
      *
-     * 规则很简单：跨天、插上充电、拔掉充电、以及没充电电量却上涨（部分设备状态不准），
-     * 都把起点重置为当前电量和此刻——充电段和放电段混在一起算，会得出负耗电或荒谬的折算率。
-     * 只有起点或充电状态真的变了才落盘，一天最多写三五次。
+     * 三条口径共用同一套累加：今日、本次充电后、近 7 天（归档日桶 + 今日）。
+     * 不记明细、不新增定时器——电量本身只有 1% 粒度，写得再密也没有多余信息。
      */
-    /**
-     * 上次没走正常退出（进程被系统杀掉、直接重启）时，最后一个点还挂着「前台」，
-     * 那一段就会被算成使用中。间隔超过 15 分钟就把它改成「离开」点。
-     */
-    public void battFixUnclosed() {
-        if (battLog.isEmpty()) return;
-        BattPoint last = battLog.get(battLog.size() - 1);
-        if (last.fg && System.currentTimeMillis() - last.at > 15L * 60000L) {
-            last.fg = false;
-            saveBattLog();
-        }
-    }
-
-    /**
-     * 记一个采样点。只在电量或前后台状态变化时追加：
-     * 电量只有 1% 粒度，每分钟硬记一条会得到几十行「90%」，信息一样、写盘却多 60 倍。
-     */
-    public void battPoint(int pct, boolean fg) {
+    public void battTick(int pct, boolean charging) {
         if (pct < 0) return;
-        if (!battLog.isEmpty()) {
-            BattPoint last = battLog.get(battLog.size() - 1);
-            if (last.pct == pct && last.fg == fg) return;      // 完全没变，不写
-        }
-        battLog.add(new BattPoint(System.currentTimeMillis(), pct, fg));
-        trimBattLog();
-        saveBattLog();
-    }
-
-    /** 只留最近 7 天，且最多 800 条（够看两天的高频变化）。 */    private void trimBattLog() {
-        long cutoff = System.currentTimeMillis() - 7L * 24 * 3600 * 1000;
-        while (!battLog.isEmpty() && (battLog.get(0).at < cutoff || battLog.size() > 800)) {
-            battLog.remove(0);
-        }
-    }
-
-    private void saveBattLog() {
-        try {
-            JSONArray a = new JSONArray();
-            for (BattPoint b : battLog) {
-                JSONObject x = new JSONObject();
-                x.put("a", b.at);
-                x.put("p", b.pct);
-                x.put("f", b.fg ? 1 : 0);
-                a.put(x);
-            }
-            p.edit().putString("btl", a.toString()).apply();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void loadBattLog(String s) {
-        if (s == null || s.isEmpty()) return;
-        try {
-            JSONArray a = new JSONArray(s);
-            for (int i = 0; i < a.length(); i++) {
-                JSONObject x = a.getJSONObject(i);
-                long at = x.optLong("a", 0);
-                int pct = x.optInt("p", -1);
-                if (at > 0 && pct >= 0) {
-                    battLog.add(new BattPoint(at, pct, x.optInt("f", 1) == 1));
-                }
-            }
-            trimBattLog();
-        } catch (Exception ignored) {
-        }
-    }
-
-    public void battSample(int pct, boolean charging) {
-        if (pct < 0) return;
-        long t = today(), now = System.currentTimeMillis();
+        long now = System.currentTimeMillis();
+        long day = today();
         boolean dirty = false;
-        if (battDay != t || battStartAt <= 0 || battStartPct < 0) {
-            battDay = t; battStartAt = now; battStartPct = pct; battCharging = charging;
+
+        // 跨天：把昨天这一桶归档，今天重新开一桶
+        if (battDay != day) {
+            if (battToday.pct >= 0 && battToday.ms >= 60000L) {
+                battToday.day = battDay;
+                battArch.add(battToday);
+                while (battArch.size() > 6) battArch.remove(0);
+            }
+            battToday = new BattAcc();
+            battDay = day;
+            dirty = true;
+        }
+
+        if (!battSeeded) {
+            battSeeded = true;
+            battCharging = charging;
+            seed(battToday, now, pct);
+            if (!charging) seed(battCharge, now, pct);
             dirty = true;
         } else if (charging != battCharging) {
             battCharging = charging;
-            battStartAt = now; battStartPct = pct;
-            dirty = true;
-        } else if (!charging && pct > battStartPct) {
-            battStartAt = now; battStartPct = pct;
+            if (charging) battCharge = new BattAcc();     // 插电：这一轮到此为止
+            else seed(battCharge, now, pct);              // 拔电：新一轮从这里起算
             dirty = true;
         }
-        if (dirty) {
-            p.edit().putLong("btd", battDay).putLong("bta", battStartAt)
-                    .putInt("btp", battStartPct).putBoolean("btc", battCharging).apply();
+
+        if (charging) {
+            if (dirty || now - battSavedAt > 5L * 60000L) saveBatt();
+            return;
+        }
+
+        boolean dropCh = step(battToday, now, pct);
+        if (battCharge.pct >= 0) dropCh |= step(battCharge, now, pct);
+
+        if (dirty || dropCh || now - battSavedAt > 5L * 60000L) saveBatt();
+    }
+
+    private static void seed(BattAcc a, long now, int pct) {
+        a.start = now;
+        a.last = now;
+        a.pct = pct;
+        a.from = pct;
+        a.ms = 0;
+        a.drop = 0;
+    }
+
+    /** 累计一段，返回累计值是否变了。 */
+    private static boolean step(BattAcc a, long now, int pct) {
+        if (a.pct < 0) { seed(a, now, pct); return true; }
+        long gap = now - a.last;
+        if (gap < 0 || gap > BATT_GAP) {
+            // 判定离开：不累加，只滑动基点。start 保持不动，
+            // 这样「累计 60 分」和「从 10:30 起算」可以同时成立。
+            a.last = now;
+            a.pct = pct;
+            return true;
+        }
+        // 时长每分钟都在涨，不能拿它当写盘信号，否则一天要写 1440 次。
+        // 只有「掉电变了」才立刻落盘，时长靠 5 分钟的兜底保存 —— 进程被杀最多丢 5 分钟。
+        boolean ch = false;
+        if (gap >= 1500L) a.ms += gap;
+        if (pct < a.pct) { a.drop += a.pct - pct; ch = true; }
+        a.last = now;
+        a.pct = pct;
+        return ch;
+    }
+
+    /** 近 7 天：归档日桶（6 天内）+ 今天的实时值。 */
+    public long batt7Ms() {
+        long s = battToday.ms;
+        for (BattAcc a : battArch) if (within7(a.day)) s += a.ms;
+        return s;
+    }
+
+    public int batt7Drop() {
+        int s = battToday.drop;
+        for (BattAcc a : battArch) if (within7(a.day)) s += a.drop;
+        return s;
+    }
+
+    private static boolean within7(long day) {
+        // yyyyMMdd 直接相减在跨月时是错的（20261101 - 20261031 = 70），先换成天序号
+        long t = today();
+        if (day <= 0 || day > t) return false;
+        return dayNum(t) - dayNum(day) <= 6;
+    }
+
+    private static long dayNum(long ymd) {
+        Calendar c = Calendar.getInstance();
+        c.set((int) (ymd / 10000), (int) (ymd / 100 % 100) - 1, (int) (ymd % 100), 0, 0, 0);
+        c.set(Calendar.MILLISECOND, 0);
+        return c.getTimeInMillis() / 86400000L;
+    }
+
+    private void saveBatt() {
+        battSavedAt = System.currentTimeMillis();
+        try {
+            JSONArray arch = new JSONArray();
+            for (BattAcc a : battArch) arch.put(accJson(a));
+            p.edit()
+                    .putString("bt1", accJson(battToday).toString())
+                    .putString("bt2", accJson(battCharge).toString())
+                    .putString("bt7", arch.toString())
+                    .putLong("btd", battDay)
+                    .putBoolean("btc", battCharging)
+                    .putBoolean("bts", battSeeded)
+                    .apply();
+        } catch (Exception ignored) {
         }
     }
 
-    /** 本次已用时长（毫秒），跨天或无数据返回 0。 */
-    public long battElapsed() {
-        if (battDay != today() || battStartAt <= 0) return 0;
-        long ms = System.currentTimeMillis() - battStartAt;
-        return ms > 0 ? ms : 0;
+    private static JSONObject accJson(BattAcc a) throws Exception {
+        JSONObject o = new JSONObject();
+        o.put("d", a.day);
+        o.put("s", a.start);
+        o.put("l", a.last);
+        o.put("p", a.pct);
+        o.put("f", a.from);
+        o.put("m", a.ms);
+        o.put("r", a.drop);
+        return o;
     }
 
-    /** 本次掉电百分比；电量未知返回 -1，没掉电返回 0。 */
-    public int battUsed(int cur) {
-        if (battDay != today() || battStartPct < 0 || cur < 0) return -1;
-        int d = battStartPct - cur;
-        return d > 0 ? d : 0;
+    private static BattAcc accFrom(String s) {
+        BattAcc a = new BattAcc();
+        try {
+            JSONObject o = new JSONObject(s);
+            a.day = o.optLong("d", 0);
+            a.start = o.optLong("s", 0);
+            a.last = o.optLong("l", 0);
+            a.pct = o.optInt("p", -1);
+            a.from = o.optInt("f", -1);
+            a.ms = o.optLong("m", 0);
+            a.drop = o.optInt("r", 0);
+        } catch (Exception ignored) {
+        }
+        return a;
+    }
+
+    private void loadBatt(String s1, String s2, String s7, long day, boolean charging, boolean seeded) {
+        if (s1 != null && !s1.isEmpty()) battToday = accFrom(s1);
+        if (s2 != null && !s2.isEmpty()) battCharge = accFrom(s2);
+        battDay = day;
+        battCharging = charging;
+        battSeeded = seeded;
+        try {
+            JSONArray arr = new JSONArray(s7 == null || s7.isEmpty() ? "[]" : s7);
+            for (int i = 0; i < arr.length(); i++) battArch.add(accFrom(arr.getString(i)));
+        } catch (Exception ignored) {
+        }
     }
 
     public void clearAll() {
@@ -802,8 +867,14 @@ public final class Store {
         pomoHist.clear();
         pomoAllRounds = 0;
         pomoAllMinutes = 0;
-        battLog.clear();
-        p.edit().remove("btl").apply();
+        battToday = new BattAcc();
+        battCharge = new BattAcc();
+        battArch.clear();
+        battDay = today();
+        battSeeded = false;
+        battCharging = false;
+        p.edit().remove("bt1").remove("bt2").remove("bt7")
+                .remove("btd").remove("btc").remove("bts").remove("btl").apply();
         save();
     }
 
