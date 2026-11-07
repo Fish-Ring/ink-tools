@@ -84,7 +84,9 @@ public final class Store {
         lunar = p.getBoolean("lunar", true);
         keepOn = p.getBoolean("keep", true);
         oled = p.getBoolean("oled", false);
-        fontScale = p.getFloat("fs", 1f);
+        // 字号档位整体上移（1.3 起步）：老版本存下的 0.9~1.15 直接提到标准档，
+        // 否则会出现「设置页写着 1/5，实际仍按 0.9 画」的错位
+        fontScale = clampFont(p.getFloat("fs", 1.3f));
         pomo.focus = p.getInt("pf", 25);
         pomo.shortBreak = p.getInt("ps", 5);
         pomo.longBreak = p.getInt("pl", 15);
@@ -607,7 +609,7 @@ public final class Store {
                 keepOn = se.optBoolean("keepOn", keepOn);
                 oled = se.optBoolean("oled", oled);
                 float f = (float) se.optDouble("fontScale", fontScale);
-                fontScale = Math.max(0.8f, Math.min(2.05f, f));
+                fontScale = clampFont(f);
             }
             if (po != null) {
                 pomo.focus = clamp(po.optInt("focus", pomo.focus), 5, 90);
@@ -637,6 +639,11 @@ public final class Store {
 
     private static int clamp(int v, int lo, int hi) {
         return Math.max(lo, Math.min(hi, v));
+    }
+
+    /** 字号只接受当前档位区间，老数据 / 手改的备份都会落到标准档上。 */
+    static float clampFont(float f) {
+        return Math.max(Screen.FONT_MIN, Math.min(Screen.FONT_MAX, f));
     }
 
     /** 番茄历史导出为 CSV：Excel / WPS 双击即表格，UTF-8 带 BOM 中文不乱码。 */

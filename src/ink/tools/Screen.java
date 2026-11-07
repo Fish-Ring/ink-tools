@@ -466,6 +466,11 @@ public class Screen extends View {
         c.drawColor(Ink.BG);
         hits.clear();
         hasTime = false;
+        // 硬兜底：页面内容一律不许画进底部导航栏。
+        // 各页虽然都按剩余高度算过，但字号 + 横屏 + 展开组合起来总有算漏的时候，
+        // 裁一刀比逐页打补丁可靠——压到菜单栏上是最刺眼的一种错。
+        c.save();
+        c.clipRect(0f, 0f, W, Math.max(0f, H - tabH));
         switch (mode) {
             case DASH:  drawDashboard(c); break;
             case CLOCK: drawClock(c);      break;
@@ -477,6 +482,7 @@ public class Screen extends View {
             case TIPS:  drawTips(c);       break;
             default: break;
         }
+        c.restore();
         drawTabs(c);
     }
 
@@ -668,11 +674,15 @@ public class Screen extends View {
     /** 每栏显示几行：按屏高算，3–7 行，避免横屏时大片空白。 */
     private int dashPer() {
         float top = pad + F(14) + F(12) + S(88) + S(10);
-        // 下方要留给「本周打卡」一条：标题 + 格子 + 间距（随字号变化）
-        float stripH = F(18) + F(13) + F(12) + S(14) + F(24);
-        float avail = miniTop() - top - stripH - F(30);
+        // 下方要留给「本周打卡」一条：标题 + 两行格子内容 + 间距。
+        // 以前按 F(24) 估格子，字号一大就把空间算成负数，行数被压到最少。
+        float stripH = F(18) + F(13) + F(9) * 2.5f + S(8) + S(10);
+        // 扣掉双栏自己的表头与分页条，剩下的才是能放的行
+        float avail = miniTop() - top - stripH - F(30) - F(22);
         int n = (int) (avail / F(21));
-        return Math.max(3, Math.min(7, n));
+        // 以前下限写死 3 行：横屏 + 大字号时剩余空间是负的，3 行直接把双栏顶进下方的
+        // 「本周打卡」里。现在从 1 行起算，真正放不下由 drawDashColumns 再收。
+        return Math.max(1, Math.min(7, n));
     }
 
     /** 台历双栏：左「今日待办」可直接勾选，右「倒数日」列出各项，各自分页。 */
@@ -686,6 +696,10 @@ public class Screen extends View {
             if (t.done) tDone++;
         }
         int dn = st.days.size(), per = dashPer();
+        // 再按「本周打卡」上沿收一次行数：大字号横屏时 dashPer 可能仍算出 2~3 行，
+        // 但那段空间只够 1 行，多出的行会压到下面的打卡条上
+        float colMax = Math.max(F(30) + F(21) + F(22), miniTop() - y - S(4));
+        while (per > 1 && F(30) + per * F(21) + F(22) > colMax) per--;
         int tp = Math.max(1, (ti.size() + per - 1) / per);
         int dp = Math.max(1, (dn + per - 1) / per);
         if (dashTodoPage >= tp) dashTodoPage = 0;
@@ -833,12 +847,30 @@ public class Screen extends View {
                 : (pomoLeftMs <= 0 ? "已结束" : "已暂停");
         T(c, state, W - pad - TW(state, 12, false, true), y, 12, false, true);
         HL(c, pad, W - pad, y + F(8));
-        y += F(30);
+
+        // 纵向预算：字号放大 + 展开网格时，先把「段间留白」按同一系数压掉。
+        // 以前留白跟着字号线性长，1.75 档一展开，暂停/重置/跳过就被推到导航栏上。
+        float g1 = F(30), g2 = F(26), g3 = F(12);
+        float min1 = S(20), min2 = S(16), min3 = S(4);
+        float numH = F(88);
+        float need = g1 + g2 + numH + S(16) + g3 + S(8) + S(10)
+                + (pomoCustom ? cfgGridH() : 0f) + S(10) + S(38);
+        float over = y + need - (H - tabH - S(6));
+        if (over > 0) {
+            float squeeze = (g1 - min1) + (g2 - min2) + (g3 - min3);
+            float k = squeeze > 0 ? Math.max(0f, 1f - over / squeeze) : 0f;
+            g1 = min1 + (g1 - min1) * k;
+            g2 = min2 + (g2 - min2) * k;
+            g3 = min3 + (g3 - min3) * k;
+        }
+
+        y += g1;
         CT(c, "第 " + pomoRound + " 轮 / " + st.pomo.rounds + " · " + phaseName()
                 + " · 今日 " + st.pomoDoneToday + " 轮", y, 11, false, false);
-        y += F(26);
-        drawMainTime(c, pomoText(), 86, y + F(60), W / 2f);
-        y += F(88);
+        y += g2;
+        // 数字固定 86dp 不跟字号，基线贴段底往上 28dp：段高被压缩时数字跟着上移，不会掉到进度条上
+        drawMainTime(c, pomoText(), 86, y + numH - S(28), W / 2f);
+        y += numH;
 
         // 轮次进度：一段一轮。已完成轮画满，正在专注的那段按时间连续填充；
         // 休息阶段不画当前段，否则一进休息就会看到进度条回退。
@@ -861,7 +893,7 @@ public class Screen extends View {
             }
         }
         // 间距跟随字号：放大字号时文字顶部不会压到进度条下边框
-        y += S(16) + F(12) + S(8);
+        y += S(16) + g3 + S(8);
 
         T(c, "自定义时长", pad, y, 12, true, false);
         String tog = pomoCustom ? "收起 -" : "展开 +";
@@ -887,7 +919,9 @@ public class Screen extends View {
 
     /** 番茄统计：双列文字（今日 / 近 7 天 / 本月 / 本年 / 累计）+ 近 7 天分钟格。 */
     private void drawPomoStats(Canvas c, float y, float availH) {
-        if (availH < F(58)) return;          // 三行文字都放不下就不画，宁缺不压导航栏
+        // 三行文字实际要占 F(34) 标题 + F(46) 正文。以前门槛写死 F(58)，
+        // 差的那几 dp 正好让第三行（本月）压到导航栏上——1.75 档展开时最明显。
+        if (availH < F(34) + F(46)) return;
         T(c, "专注统计", pad, y + F(12), 12, true, false);
         String hist = "历史 ›";
         float hw = TW(hist, 10, false, false);
@@ -1070,12 +1104,22 @@ public class Screen extends View {
         return r;
     }
 
+    /** 步进按钮边长与格子高度：预算和绘制共用一套公式，避免各算各的。 */
+    private float cfgStepH() { return Math.max(S(22), F(13) + S(7)); }
+
+    private float cfgCellH() {
+        return Math.max(S(50), F(13) + S(10) + cfgStepH() + S(10));
+    }
+
+    /** 展开网格的实高（两行 + 行距），用来给番茄页做纵向预算。 */
+    private float cfgGridH() { return 2 * cfgCellH() + S(7); }
+
     private float drawCfgGrid(Canvas c, float y) {
         String[] labels = {"工作 · 分钟", "短休 · 分钟", "长休 · 分钟", "轮数 · 轮"};
         int[] vals = {st.pomo.focus, st.pomo.shortBreak, st.pomo.longBreak, st.pomo.rounds};
         // 方框高度跟着文字算：写死 S(50)/S(22) 时，大字号下「+ / -」和数值会顶出框
-        float sb = Math.max(S(22), F(13) + S(7));
-        float ih = Math.max(S(50), F(13) + S(10) + sb + S(10));
+        float sb = cfgStepH();
+        float ih = cfgCellH();
         float gap = S(7), cw = (W - 2 * pad - gap) / 2f;
         for (int i = 0; i < 4; i++) {
             int col = i % 2, row = i / 2;
@@ -1587,30 +1631,23 @@ public class Screen extends View {
 
     // ---------------------------------------------------------------- 设置 / 建议
 
-    /** 字号档位名。区间比较，避免浮点相等判断失准。 */
-    /** 7 档字号：点「字号」行按顺序循环，最高 2.0 倍。 */
-    private static final float[] FONT_STEPS = {0.9f, 1f, 1.15f, 1.3f, 1.5f, 1.75f, 2f};
+    /**
+     * 5 档字号：1.3 起步（标准档），最高 2.3。
+     * 早先最小档是 0.9，实际用不上——墨水屏离眼远，0.9 比系统默认还小；
+     * 而大字号那一端又不够用，所以整条曲线整体上移。
+     */
+    static final float[] FONT_STEPS = {1.3f, 1.5f, 1.75f, 2f, 2.3f};
+    static final float FONT_MIN = FONT_STEPS[0], FONT_MAX = FONT_STEPS[FONT_STEPS.length - 1];
 
-    /** 当前字号落在第几档（旧版本遗留的 0.85 也能对上最近档）。 */
+    /** 当前字号落在第几档（导入的旧值也会先钳到区间内）。 */
     private int fontStep() {
-        int at = 2;
+        int at = 0;
         float best = 9f;
         for (int i = 0; i < FONT_STEPS.length; i++) {
             float dd = Math.abs(FONT_STEPS[i] - st.fontScale);
             if (dd < best) { best = dd; at = i; }
         }
         return at;
-    }
-
-    private String fontName() {
-        float f = st.fontScale;
-        if (f < 0.95f) return "小";
-        if (f < 1.08f) return "标准";
-        if (f < 1.22f) return "大";
-        if (f < 1.4f) return "特大";
-        if (f < 1.62f) return "超大";
-        if (f < 1.88f) return "巨无霸";
-        return "超巨";
     }
 
     private String fontScaleText() {
@@ -1632,7 +1669,7 @@ public class Screen extends View {
                 st.lunar ? "开" : "关",
                 st.keepOn ? "开" : "关",
                 st.oled ? "黑底白字" : "关",
-                fontName() + " " + fontScaleText() + "　" + (fontStep() + 1) + "/7",
+                fontScaleText() + "　" + (fontStep() + 1) + "/" + FONT_STEPS.length,
                 st.pomo.focus + "/" + st.pomo.shortBreak + "/" + st.pomo.longBreak + " ›",
                 battText(),
                 "›", "JSON ›", "JSON ›", "›"
