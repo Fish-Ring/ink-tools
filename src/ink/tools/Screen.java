@@ -426,13 +426,14 @@ public class Screen extends View {
         return b.toString();
     }
 
+    /** 折算成 %/小时。样本不足 5 分钟不给——1% 的粒度下那个数字会离谱。 */
     private void addRate(StringBuilder b, int drop, long ms) {
         double hours = ms / 3600000.0;
-        if (drop > 0 && hours >= 0.5) {
-            b.append("\n折算　　约 ")
-                    .append(String.format(java.util.Locale.US, "%.1f", drop / hours))
-                    .append("% / 小时");
-        }
+        if (hours < 0.08) return;
+        String v = drop > 0
+                ? String.format(java.util.Locale.US, "%.1f", drop / hours)
+                : "不足 0.1";
+        b.append("\n折算　　").append(v).append("% / 小时");
     }
 
     private static String durText(long ms) {
@@ -1669,11 +1670,11 @@ public class Screen extends View {
      * 早先最小档是 0.9，实际用不上——墨水屏离眼远，0.9 比系统默认还小；
      * 而大字号那一端又不够用，所以整条曲线整体上移。
      */
-    static final float[] FONT_STEPS = {1.3f, 1.5f, 1.75f, 2f, 2.3f};
+    static final float[] FONT_STEPS = {1.3f, 1.5f, 1.75f, 2f, 2.3f, 2.7f, 3.1f};
     static final float FONT_MIN = FONT_STEPS[0], FONT_MAX = FONT_STEPS[FONT_STEPS.length - 1];
 
     /** 当前字号落在第几档（导入的旧值也会先钳到区间内）。 */
-    private int fontStep() {
+    int fontStep() {
         int at = 0;
         float best = 9f;
         for (int i = 0; i < FONT_STEPS.length; i++) {
@@ -1690,7 +1691,7 @@ public class Screen extends View {
     private void drawSettings(Canvas c) {
         float y = pad + F(20);
         T(c, "设置", pad, y, 17, true, false);
-        T(c, "v0.0.21", W - pad - TW("v0.0.21", 12, false, true), y, 12, false, true);
+        T(c, "v0.0.22", W - pad - TW("v0.0.22", 12, false, true), y, 12, false, true);
         HL(c, pad, W - pad, y + F(8));
         y += F(22);
 
@@ -1713,11 +1714,19 @@ public class Screen extends View {
         perRow = Math.max(F(15), perRow);
         for (int i = 0; i < keys.length; i++) {
             float ry = y + perRow * 0.62f;
-            T(c, keys[i], pad, ry, 13, false, false);
             boolean on = vals[i].equals("开");
-            T(c, vals[i], W - pad - TW(vals[i], 12, on, true), ry, 12, on, true);
+            // 右侧值先按 12 号排；挤不下就降到 10 号，再挤不下才截断。
+            // 3.1 档下「番茄钟时长 25/5/15 ›」这类长值必须让位，不能压到左边的标题上。
+            float maxV = W - 2 * pad - TW(keys[i], 13, false, false) - S(10);
+            String v = vals[i];
+            float vs = 12;
+            if (TW(v, 12, on, true) > maxV) vs = 10;
+            if (TW(v, vs, on, true) > maxV) v = fit(v, vs, maxV, on, true);
+            float vw = TW(v, vs, on, true);
+            T(c, keys[i], pad, ry, 13, false, false);
+            T(c, v, W - pad - vw, ry, vs, on, true);
             if (on) {
-                float vx = W - pad - TW(vals[i], 12, true, true);
+                float vx = W - pad - vw;
                 Ink.line(c, vx, ry + F(4), W - pad, S(2));
             }
             HIT("set", i, pad, ry - perRow * 0.55f, W - pad, ry + perRow * 0.32f);
@@ -2222,11 +2231,7 @@ public class Screen extends View {
                 case 5: {
                     // 点一下直接进下一档（到顶回到底）：不再弹窗，改完立刻看得见。
                     // 之前走系统列表弹窗，在墨水屏上点中哪一项全凭手感，很容易「点了没反应」。
-                    float[] opts = FONT_STEPS;
-                    int at = fontStep();
-                    st.fontScale = opts[(at + 1) % opts.length];
-                    st.save();
-                    invalidate();
+                    act.fontDialog();
                     break;
                 }
                 case 6: mode = POMO; schedule(); invalidate(); break;

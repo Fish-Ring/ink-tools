@@ -76,6 +76,13 @@ public class MainActivity extends Activity {
         // OLED 模式整屏反色，窗口与系统栏要跟着一起黑，否则四周会露白边
         int bg = store.oled ? 0xFF000000 : 0xFFFFFFFF;
         w.setBackgroundDrawable(new ColorDrawable(bg));
+        if (Build.VERSION.SDK_INT >= 28) {
+            // 让内容铺到挖孔/刘海那一行，而不是被系统缩进一块
+            WindowManager.LayoutParams lp = w.getAttributes();
+            lp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            w.setAttributes(lp);
+        }
         if (Build.VERSION.SDK_INT >= 21) {
             w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
             w.setStatusBarColor(bg);
@@ -83,6 +90,11 @@ public class MainActivity extends Activity {
         }
         if (Build.VERSION.SDK_INT >= 30) {
             w.setDecorFitsSystemWindows(false);
+            // 有些 ROM 只认老 flag，两套一起设才能真的铺到状态栏和挖孔那一行
+            w.getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
             WindowInsetsController c = w.getInsetsController();
             if (c != null) {
                 // 深色底用浅色图标，白底用深色图标
@@ -107,6 +119,26 @@ public class MainActivity extends Activity {
             }
             w.getDecorView().setSystemUiVisibility(f);
         }
+    }
+
+    /** 字号：七档单选，点一下立即生效，不用来回点着试。 */
+    public void fontDialog() {
+        final float[] steps = Screen.FONT_STEPS;
+        String[] items = new String[steps.length];
+        for (int i = 0; i < steps.length; i++) items[i] = String.valueOf(steps[i]);
+        new AlertDialog.Builder(this)
+                .setTitle("字号")
+                .setSingleChoiceItems(items, screen.fontStep(),
+                        new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface d, int which) {
+                                store.fontScale = steps[which];
+                                store.save();
+                                screen.invalidate();
+                                d.dismiss();
+                            }
+                        })
+                .setNegativeButton("关闭", null)
+                .show();
     }
 
     /** 电量统计：一个弹窗，三条口径（今日 / 本次充电后 / 近 7 天）轮流看。 */
