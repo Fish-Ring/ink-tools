@@ -267,6 +267,15 @@ public class MainActivity extends Activity {
                 c.get(Calendar.DAY_OF_MONTH)).show();
     }
 
+    /** 纯展示：只有一个「知道了」，避免为了一条说明引出一串交互。 */
+    public void info(String title, String msg) {
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(msg)
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
     public void confirm(String title, String msg, final Runnable ok) {
         new AlertDialog.Builder(this)
                 .setTitle(title)

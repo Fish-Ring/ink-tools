@@ -41,6 +41,9 @@ public class Screen extends View {
     private String timeStr = "";
 
     private int clockMeta = 0;                 // 0 农历 / 1 电量 / 2 无
+    private int battShown = Integer.MIN_VALUE; // 上一次画出的电量，只用于比对是否要重绘那一行
+    private final android.content.IntentFilter battFilter =
+            new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED);
     private int pomoPhase = 0;                 // 0 专注 / 1 短休 / 2 长休
     private int pomoRound = 1;
     private boolean pomoRunning = false, pomoCustom = true;
@@ -54,6 +57,7 @@ public class Screen extends View {
     private boolean habitEdit;                 // 月历是否处于「补记」态（默认只读）
     private int dashTodoPage, dashDayPage;     // 台历双栏翻页
     private long lastDay;                     // 跨天检测
+    private long lastBattCheck;               // 上次读电量的时刻（毫秒），限流用
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private Runnable ticker;
@@ -115,6 +119,9 @@ public class Screen extends View {
         timeStr = "";
         lastDay = Store.today();
         if (st.rolloverIfNeeded()) st.save();
+        // 启动即采一次，别等第一次 tick——否则刚打开就看「电量统计」会是空的
+        lastBattCheck = System.currentTimeMillis();
+        st.battSample(battery(), charging());
         cancelLong();
         schedule();
         invalidate();
@@ -155,6 +162,25 @@ public class Screen extends View {
         else if (!pomoHist && (mode == DASH || mode == CLOCK || mode == POMO)) refreshTime(main);
         else timeStr = main;
         if (pomoRunning) checkPomo();
+
+        // 电量搭「时间跳变」的顺风车核对：55 秒一次，显示秒时也不会每秒去读电池。
+        // 只有整数百分比变了才重绘农历/电量那条横带——以前这里不刷，电量要手动点一下才更新。
+        if (now - lastBattCheck >= 55000L) {
+            lastBattCheck = now;
+            int b = battery();
+            if (b >= 0 && b != battShown && mode == CLOCK && clockMeta == 1) {
+                battShown = b;
+                invalidateMetaRow();
+            }
+            st.battSample(b, charging());
+        }
+    }
+
+    /** 只重绘时钟页「农历 / 电量」那一条横带，不动大数字，避免整屏闪。 */
+    private void invalidateMetaRow() {
+        if (W <= 0 || H <= 0) return;
+        float y = (H - tabH) / 2f + S(82);
+        invalidate((int) pad, (int) (y - F(18)), (int) (W - pad), (int) (y + F(6)));
     }
 
     /** 只让变化的字符失效，避免整屏重绘。 */
@@ -329,6 +355,60 @@ public class Screen extends View {
         } catch (Throwable ignored) {
         }
         return -1;
+    }
+
+    /** 是否正在充电。用粘性广播读，零权限；读不到就当没充。 */
+    private boolean charging() {
+        try {
+            android.content.Intent i = act.registerReceiver(null, battFilter);
+            if (i == null) return false;
+            int s = i.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
+            return s == android.os.BatteryManager.BATTERY_STATUS_CHARGING
+                    || s == android.os.BatteryManager.BATTERY_STATUS_FULL;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 设置页那一行的值：尽量短，大字号下也不能把左边文字挤掉。 */
+    private String battText() {
+        int cur = battery();
+        if (st.battCharging) return cur >= 0 ? "充电 " + cur + "%" : "充电中";
+        long ms = st.battElapsed();
+        int used = st.battUsed(cur);
+        if (ms < 60000L || used < 0) return cur >= 0 ? cur + "%" : "—";
+        long m = ms / 60000L;
+        String d = m < 60 ? m + "m" : (m / 60) + "h" + (m % 60) + "m";
+        return d + " · " + used + "%";
+    }
+
+    /** 点开的详情：说清从哪儿算起、为什么只有整机数据。 */
+    private String battDetail() {
+        int cur = battery();
+        if (cur < 0) return "这台设备读不到电量，无法统计。";
+        if (st.battCharging) {
+            return "正在充电，当前 " + cur + "%。\n拔掉电源后会重新起算。";
+        }
+        long ms = st.battElapsed();
+        int used = st.battUsed(cur);
+        if (ms < 60000L || used < 0) {
+            return "刚开始记录，过几分钟再看。\n当前电量 " + cur + "%。";
+        }
+        long m = ms / 60000L;
+        String d = m < 60 ? m + " 分钟" : (m / 60) + " 小时 " + (m % 60) + " 分";
+        StringBuilder b = new StringBuilder();
+        b.append("本次使用　").append(d).append('\n');
+        b.append("耗电　　　").append(used).append("%（")
+                .append(st.battStartPct).append("% → ").append(cur).append("%）");
+        double hours = ms / 3600000.0;
+        if (used > 0 && hours >= 0.5) {
+            b.append('\n').append("折算　　　约 ")
+                    .append(String.format(java.util.Locale.US, "%.1f", used / hours))
+                    .append("% / 小时");
+        }
+        b.append("\n\n从插拔电源或今天首次打开起算。只能统计整机耗电——");
+        b.append("系统按 1% 一档报数，短时间内的数字只当参考。");
+        return b.toString();
     }
 
     private static String stamp(long ms) {
@@ -735,6 +815,8 @@ public class Screen extends View {
             }
         } else if (clockMeta == 1) {
             int b = battery();
+            // 画一次就把当前值记下，tick 里才能判断「变了没有」，空白档不会误刷
+            battShown = b >= 0 ? b : Integer.MIN_VALUE;
             meta = b >= 0 ? "电量 " + b + "%" : "电量 未知";
         }
         if (!meta.isEmpty()) CT(c, meta, cy + S(82), 13, false, false);
@@ -1538,12 +1620,12 @@ public class Screen extends View {
     private void drawSettings(Canvas c) {
         float y = pad + F(20);
         T(c, "设置", pad, y, 17, true, false);
-        T(c, "v0.0.18", W - pad - TW("v0.0.18", 12, false, true), y, 12, false, true);
+        T(c, "v0.0.19", W - pad - TW("v0.0.19", 12, false, true), y, 12, false, true);
         HL(c, pad, W - pad, y + F(8));
         y += F(22);
 
         String[] keys = {"显示秒", "时间制", "农历", "保持常亮", "OLED 模式", "字号",
-                "番茄钟时长", "墨水屏使用建议", "导出配置", "导入配置", "清空数据"};
+                "番茄钟时长", "电量统计", "墨水屏使用建议", "导出配置", "导入配置", "清空数据"};
         String[] vals = {
                 st.showSeconds ? "开" : "关",
                 st.h24 ? "24 小时" : "12 小时",
@@ -1552,9 +1634,10 @@ public class Screen extends View {
                 st.oled ? "黑底白字" : "关",
                 fontName() + " " + fontScaleText() + "　" + (fontStep() + 1) + "/7",
                 st.pomo.focus + "/" + st.pomo.shortBreak + "/" + st.pomo.longBreak + " ›",
+                battText(),
                 "›", "JSON ›", "JSON ›", "›"
         };
-        // 行距自适应：9 行 × F(38) 在大字号竖屏会整体溢出到 tab 栏，
+        // 行距自适应：12 行 × F(38) 在大字号竖屏会整体溢出到 tab 栏，
         // 这里按剩余高度算行距（下限略高于字高，绝不叠行）
         float perRow = Math.min(F(38), (H - tabH - S(22) - y) / keys.length);
         perRow = Math.max(F(15), perRow);
@@ -2039,8 +2122,9 @@ public class Screen extends View {
                     break;
                 }
                 case 6: mode = POMO; schedule(); invalidate(); break;
-                case 7: mode = TIPS; invalidate(); break;
-                case 8: {
+                case 7: act.info("电量统计", battDetail()); break;
+                case 8: mode = TIPS; invalidate(); break;
+                case 9: {
                     // 两份可选：默认只导配置，明细一天一条，几百天会把文件顶得很长
                     act.choose("导出配置", new CharSequence[]{
                                     "仅配置　不含番茄明细",
@@ -2055,9 +2139,10 @@ public class Screen extends View {
                             });
                     break;
                 }
-                case 9:
+                case 10:
                     act.openFile("application/json", new MainActivity.Cb() {
                         @Override public void run(final String s) {
+                            if (s == null || s.trim().isEmpty()) { act.toast("文件是空的"); return; }
                             final int days = Store.backupHistDays(s);
                             if (days < 0) { act.toast("不是 Ink Tools 的配置文件"); return; }
                             // 不含番茄明细的备份：只有「覆盖配置」这一种，直接确认
@@ -2080,7 +2165,7 @@ public class Screen extends View {
                         }
                     });
                     break;
-                case 10:
+                case 11:
                     act.confirm("清空数据", "将删除全部待办、习惯与倒数日，且不可恢复。",
                             new Runnable() {
                                 @Override public void run() { st.clearAll(); invalidate(); }

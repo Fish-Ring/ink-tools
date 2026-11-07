@@ -71,6 +71,12 @@ public final class Store {
     private long pomoDoneDay;
     private int habitMonth;                   // yyyyMM，用于跨月清空打卡格
 
+    // 电量统计：只记「今天第一次采样时的电量」，跨天自动重来。
+    // 不碰任何系统统计接口——零权限能拿到的原始数据只有百分比，够用就行。
+    public int battStartPct = -1;
+    public long battStartAt = 0, battDay = 0;
+    public boolean battCharging = false;
+
     public Store(Context c) {
         p = c.getSharedPreferences("eink", Context.MODE_PRIVATE);
         showSeconds = p.getBoolean("sec", false);
@@ -86,6 +92,10 @@ public final class Store {
         pomoDoneToday = p.getInt("pd", 0);
         pomoDoneDay = p.getLong("pdd", 0);
         habitMonth = p.getInt("hm", 0);
+        battStartPct = p.getInt("btp", -1);
+        battStartAt = p.getLong("bta", 0);
+        battDay = p.getLong("btd", 0);
+        battCharging = p.getBoolean("btc", false);
         loadPomoHist(p.getString("ph", ""));
         pomoAllRounds = p.getInt("par", 0);
         pomoAllMinutes = p.getInt("pam", 0);
@@ -649,6 +659,48 @@ public final class Store {
         b.append("合计,,").append(tr).append(',').append(tm).append("\r\n");
         b.append("终身累计,,").append(pomoAllRounds).append(',').append(pomoAllMinutes).append("\r\n");
         return b.toString();
+    }
+
+    /**
+     * 采样一次电量，维护「本次使用」的起点。
+     *
+     * 规则很简单：跨天、插上充电、拔掉充电、以及没充电电量却上涨（部分设备状态不准），
+     * 都把起点重置为当前电量和此刻——充电段和放电段混在一起算，会得出负耗电或荒谬的折算率。
+     * 只有起点或充电状态真的变了才落盘，一天最多写三五次。
+     */
+    public void battSample(int pct, boolean charging) {
+        if (pct < 0) return;
+        long t = today(), now = System.currentTimeMillis();
+        boolean dirty = false;
+        if (battDay != t || battStartAt <= 0 || battStartPct < 0) {
+            battDay = t; battStartAt = now; battStartPct = pct; battCharging = charging;
+            dirty = true;
+        } else if (charging != battCharging) {
+            battCharging = charging;
+            battStartAt = now; battStartPct = pct;
+            dirty = true;
+        } else if (!charging && pct > battStartPct) {
+            battStartAt = now; battStartPct = pct;
+            dirty = true;
+        }
+        if (dirty) {
+            p.edit().putLong("btd", battDay).putLong("bta", battStartAt)
+                    .putInt("btp", battStartPct).putBoolean("btc", battCharging).apply();
+        }
+    }
+
+    /** 本次已用时长（毫秒），跨天或无数据返回 0。 */
+    public long battElapsed() {
+        if (battDay != today() || battStartAt <= 0) return 0;
+        long ms = System.currentTimeMillis() - battStartAt;
+        return ms > 0 ? ms : 0;
+    }
+
+    /** 本次掉电百分比；电量未知返回 -1，没掉电返回 0。 */
+    public int battUsed(int cur) {
+        if (battDay != today() || battStartPct < 0 || cur < 0) return -1;
+        int d = battStartPct - cur;
+        return d > 0 ? d : 0;
     }
 
     public void clearAll() {
