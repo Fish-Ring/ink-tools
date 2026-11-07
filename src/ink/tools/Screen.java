@@ -671,7 +671,7 @@ public class Screen extends View {
         return n > 0 ? n + "天" : (-n) + "天前";
     }
 
-    /** 每栏显示几行：按屏高算，3–7 行，避免横屏时大片空白。 */
+    /** 每栏显示几行：按屏高算，1–7 行，避免横屏时大片空白。 */
     private int dashPer() {
         float top = pad + F(14) + F(12) + S(88) + S(10);
         // 下方要留给「本周打卡」一条：标题 + 两行格子内容 + 间距。
