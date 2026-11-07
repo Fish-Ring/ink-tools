@@ -77,6 +77,21 @@ public final class Store {
     public long battStartAt = 0, battDay = 0;
     public boolean battCharging = false;
 
+    /**
+     * 电量明细的一个采样点。
+     * fg 表示「从这个点起是否在前台」：退出时记一个 fg=false 的点，
+     * 回来时记一个 fg=true 的点，中间那段就是「离开期间」，能和「使用中」分开算。
+     */
+    public static final class BattPoint {
+        public long at;
+        public int pct;
+        public boolean fg;
+        BattPoint(long a, int p, boolean f) { at = a; pct = p; fg = f; }
+    }
+
+    /** 最近 7 天的采样点，按时间正序；只在电量 / 前后台变化时追加。 */
+    public final ArrayList<BattPoint> battLog = new ArrayList<>();
+
     public Store(Context c) {
         p = c.getSharedPreferences("eink", Context.MODE_PRIVATE);
         showSeconds = p.getBoolean("sec", false);
@@ -99,6 +114,7 @@ public final class Store {
         battDay = p.getLong("btd", 0);
         battCharging = p.getBoolean("btc", false);
         loadPomoHist(p.getString("ph", ""));
+        loadBattLog(p.getString("btl", ""));
         pomoAllRounds = p.getInt("par", 0);
         pomoAllMinutes = p.getInt("pam", 0);
         if (pomoAllRounds == 0 && !pomoHist.isEmpty()) {
@@ -675,6 +691,73 @@ public final class Store {
      * 都把起点重置为当前电量和此刻——充电段和放电段混在一起算，会得出负耗电或荒谬的折算率。
      * 只有起点或充电状态真的变了才落盘，一天最多写三五次。
      */
+    /**
+     * 上次没走正常退出（进程被系统杀掉、直接重启）时，最后一个点还挂着「前台」，
+     * 那一段就会被算成使用中。间隔超过 15 分钟就把它改成「离开」点。
+     */
+    public void battFixUnclosed() {
+        if (battLog.isEmpty()) return;
+        BattPoint last = battLog.get(battLog.size() - 1);
+        if (last.fg && System.currentTimeMillis() - last.at > 15L * 60000L) {
+            last.fg = false;
+            saveBattLog();
+        }
+    }
+
+    /**
+     * 记一个采样点。只在电量或前后台状态变化时追加：
+     * 电量只有 1% 粒度，每分钟硬记一条会得到几十行「90%」，信息一样、写盘却多 60 倍。
+     */
+    public void battPoint(int pct, boolean fg) {
+        if (pct < 0) return;
+        if (!battLog.isEmpty()) {
+            BattPoint last = battLog.get(battLog.size() - 1);
+            if (last.pct == pct && last.fg == fg) return;      // 完全没变，不写
+        }
+        battLog.add(new BattPoint(System.currentTimeMillis(), pct, fg));
+        trimBattLog();
+        saveBattLog();
+    }
+
+    /** 只留最近 7 天，且最多 800 条（够看两天的高频变化）。 */    private void trimBattLog() {
+        long cutoff = System.currentTimeMillis() - 7L * 24 * 3600 * 1000;
+        while (!battLog.isEmpty() && (battLog.get(0).at < cutoff || battLog.size() > 800)) {
+            battLog.remove(0);
+        }
+    }
+
+    private void saveBattLog() {
+        try {
+            JSONArray a = new JSONArray();
+            for (BattPoint b : battLog) {
+                JSONObject x = new JSONObject();
+                x.put("a", b.at);
+                x.put("p", b.pct);
+                x.put("f", b.fg ? 1 : 0);
+                a.put(x);
+            }
+            p.edit().putString("btl", a.toString()).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void loadBattLog(String s) {
+        if (s == null || s.isEmpty()) return;
+        try {
+            JSONArray a = new JSONArray(s);
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject x = a.getJSONObject(i);
+                long at = x.optLong("a", 0);
+                int pct = x.optInt("p", -1);
+                if (at > 0 && pct >= 0) {
+                    battLog.add(new BattPoint(at, pct, x.optInt("f", 1) == 1));
+                }
+            }
+            trimBattLog();
+        } catch (Exception ignored) {
+        }
+    }
+
     public void battSample(int pct, boolean charging) {
         if (pct < 0) return;
         long t = today(), now = System.currentTimeMillis();
@@ -719,6 +802,8 @@ public final class Store {
         pomoHist.clear();
         pomoAllRounds = 0;
         pomoAllMinutes = 0;
+        battLog.clear();
+        p.edit().remove("btl").apply();
         save();
     }
 

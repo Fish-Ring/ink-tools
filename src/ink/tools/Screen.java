@@ -25,7 +25,7 @@ import java.util.Calendar;
 public class Screen extends View {
 
     static final int DASH = 0, CLOCK = 1, POMO = 2, TODO = 3,
-            HABIT = 4, DAYS = 5, SET = 6, TIPS = 7;
+            HABIT = 4, DAYS = 5, SET = 6, TIPS = 7, BATT = 8;
     static final String[] TABS = {"台历", "时钟", "番茄", "清单", "打卡", "倒数", "设置"};
 
     private final MainActivity act;
@@ -49,6 +49,7 @@ public class Screen extends View {
     private boolean pomoRunning = false, pomoCustom = true;
     private boolean pomoHist;                  // 番茄页是否在看历史列表
     private int pomoHistPage;                  // 历史列表翻页
+    private int battPage;                      // 电量明细翻页
     private int pomoHistRange = 0;             // 历史范围：0 本月 / 1 上月 / 2 全部
     private long pomoEndAt = 0, pomoLeftMs;
     private int todoScope = 0;                 // 0 今天 / 1 全部
@@ -122,6 +123,8 @@ public class Screen extends View {
         // 启动即采一次，别等第一次 tick——否则刚打开就看「电量统计」会是空的
         lastBattCheck = System.currentTimeMillis();
         st.battSample(battery(), charging());
+        st.battFixUnclosed();               // 上次若被系统杀掉，先补上「离开」
+        st.battPoint(battery(), true);      // 进前台记一个点，之后才算得出「回来到现在」
         cancelLong();
         schedule();
         invalidate();
@@ -131,6 +134,9 @@ public class Screen extends View {
         started = false;
         if (ticker != null) h.removeCallbacks(ticker);
         cancelLong();
+        // 离开前台也记一个点：下次回来看明细时，这段才能标成「离开期间」，
+        // 而不是混进「使用中」里把前台耗电算高
+        st.battPoint(battery(), false);
     }
 
     private void schedule() {
@@ -173,6 +179,9 @@ public class Screen extends View {
                 invalidateMetaRow();
             }
             st.battSample(b, charging());
+            st.battPoint(b, true);
+            // 明细页正开着就顺手刷一次，否则要退出去再进来才看得到新的一段
+            if (mode == BATT) invalidate();
         }
     }
 
@@ -480,6 +489,7 @@ public class Screen extends View {
             case DAYS:  drawDays(c);       break;
             case SET:   drawSettings(c);   break;
             case TIPS:  drawTips(c);       break;
+            case BATT:  drawBatt(c);       break;
             default: break;
         }
         c.restore();
@@ -1657,7 +1667,7 @@ public class Screen extends View {
     private void drawSettings(Canvas c) {
         float y = pad + F(20);
         T(c, "设置", pad, y, 17, true, false);
-        T(c, "v0.0.19", W - pad - TW("v0.0.19", 12, false, true), y, 12, false, true);
+        T(c, "v0.0.20", W - pad - TW("v0.0.20", 12, false, true), y, 12, false, true);
         HL(c, pad, W - pad, y + F(8));
         y += F(22);
 
@@ -1691,6 +1701,132 @@ public class Screen extends View {
             y += perRow;
         }
 
+    }
+
+    // ---------------------------------------------------------------- 电量明细
+
+    private static String hhmm(long ms) {
+        Calendar c = Calendar.getInstance();
+        c.setTimeInMillis(ms);
+        return ClockText.two(c.get(Calendar.HOUR_OF_DAY)) + ":"
+                + ClockText.two(c.get(Calendar.MINUTE));
+    }
+
+    private static String mdhm(long ms) {
+        Calendar c = Calendar.getInstance();
+        c.setTimeInMillis(ms);
+        return ClockText.two(c.get(Calendar.MONTH) + 1) + "-"
+                + ClockText.two(c.get(Calendar.DAY_OF_MONTH)) + " " + hhmm(ms);
+    }
+
+    private static boolean sameDay(long a, long b) {
+        Calendar x = Calendar.getInstance(), y = Calendar.getInstance();
+        x.setTimeInMillis(a);
+        y.setTimeInMillis(b);
+        return x.get(Calendar.YEAR) == y.get(Calendar.YEAR)
+                && x.get(Calendar.DAY_OF_YEAR) == y.get(Calendar.DAY_OF_YEAR);
+    }
+
+    /** 区间文字：同天只写时间，隔天用「昨」，再久写日期；宽度都控制在 11~12 字。 */
+    private static String rangeText(long a, long b) {
+        if (sameDay(a, b)) return hhmm(a) + "–" + hhmm(b);
+        Calendar x = Calendar.getInstance(), y = Calendar.getInstance();
+        x.setTimeInMillis(a);
+        y.setTimeInMillis(b);
+        if (y.get(Calendar.YEAR) == x.get(Calendar.YEAR)
+                && y.get(Calendar.DAY_OF_YEAR) - x.get(Calendar.DAY_OF_YEAR) == 1) {
+            return "昨" + hhmm(a) + "–" + hhmm(b);
+        }
+        return mdhm(a);
+    }
+
+    /**
+     * 电量明细：把采样点连成区间，一行 = 一段保持某电量的时间。
+     * 只存变化点，所以一天只有二三十行；离开前记的点单独标「离开」，
+     * 哪段是待机掉的、哪段是开着屏幕掉的，一眼能分开。
+     */
+    private void drawBatt(Canvas c) {
+        float y = pad + F(20);
+        T(c, "电量明细", pad, y, 17, true, false);
+        String back = "‹ 设置";
+        float bkw = TW(back, 12, false, true);
+        T(c, back, W - pad - bkw, y, 12, false, true);
+        HIT("tab", SET, W - pad - bkw - S(14), y - F(16), W - pad + S(6), y + F(8));
+        HL(c, pad, W - pad, y + F(8));
+        y += F(26);
+
+        java.util.ArrayList<Store.BattPoint> log = st.battLog;
+        Calendar cal = Calendar.getInstance();
+        cal.set(Calendar.HOUR_OF_DAY, 0);
+        cal.set(Calendar.MINUTE, 0);
+        cal.set(Calendar.SECOND, 0);
+        cal.set(Calendar.MILLISECOND, 0);
+        long dayStart = cal.getTimeInMillis();
+
+        int first = -1;
+        for (int i = 0; i < log.size(); i++) {
+            if (log.get(i).at >= dayStart) { first = i; break; }
+        }
+
+        if (first < 0 || log.size() - first < 2) {
+            T(c, "今天的记录还不够。", pad, y + F(14), 11, false, false);
+            T(c, "每掉 1% 记一条，离开前也会记一条；", pad, y + F(38), 9.5f, false, true);
+            T(c, "开着放一会儿再进来就能看到。", pad, y + F(56), 9.5f, false, true);
+        } else {
+            Store.BattPoint a0 = log.get(first), a1 = log.get(log.size() - 1);
+            int mins = (int) Math.max(0, (a1.at - a0.at) / 60000L);
+            int drop = a0.pct - a1.pct;
+            T(c, "今日 " + hhmm(a0.at) + " 起 · " + dur(mins), pad, y + F(13), 11, false, false);
+            String line = a0.pct + "% → " + a1.pct + "% · "
+                    + (drop > 0 ? "降 " + drop + "%"
+                    : (drop < 0 ? "升 " + (-drop) + "%（充电）" : "没掉电"));
+            if (drop > 0 && mins >= 30) {
+                line += " · 约 " + String.format(java.util.Locale.US, "%.2f",
+                        drop * 60f / mins) + "%/时";
+            }
+            T(c, fit(line, 10, W - 2 * pad, false, true), pad, y + F(33), 10, false, true);
+            y += F(46);
+        }
+
+        int segs = Math.max(0, log.size() - 1);
+        float pageY = H - tabH - S(24);
+        float rowH = F(32);
+        int per = Math.max(1, (int) ((pageY - S(14) - y) / rowH));
+        int pages = Math.max(1, (segs + per - 1) / per);
+        if (battPage >= pages) battPage = 0;
+        if (battPage < 0) battPage = 0;
+
+        if (segs == 0) {
+            T(c, "还没有区间数据，过几分钟再看。", pad, y + F(20), 10, false, false);
+        }
+
+        for (int k = 0; k < per; k++) {
+            int j = segs - 1 - (battPage * per + k);       // 最近的在最上面
+            if (j < 0) break;
+            Store.BattPoint a = log.get(j), b = log.get(j + 1);
+            int mins = (int) Math.max(0, (b.at - a.at) / 60000L);
+            float ry = y + k * rowH + F(16);
+
+            String range = rangeText(a.at, b.at);
+            T(c, range, pad, ry, 9.5f, false, true);
+
+            int d = a.pct - b.pct;
+            String pv = a.pct + "%→" + b.pct + "%";
+            // 列位置跟着时间列的实际宽度走：字号调到 2.3 时 11 个等宽字符会顶到电量列上
+            float px = pad + Math.max(S(100), TW(range, 9.5f, false, true) + S(10));
+            T(c, pv, px, ry, 9.5f, false, true);
+
+            String tag = d < 0 ? "充电" : (a.fg ? "" : "离开");
+            String tail = mins < 60 ? mins + " 分"
+                    : (mins / 60) + "h" + ClockText.two(mins % 60) + "m";
+            float tw = TW(tail, 9, false, true);
+            float tagW = tag.isEmpty() ? 0 : TW(tag, 9, false, false) + S(10);
+            T(c, tail, W - pad - tagW - tw, ry, 9, false, true);
+            if (!tag.isEmpty()) T(c, tag, W - pad - TW(tag, 9, false, false), ry, 9, false, false);
+            HL(c, pad, W - pad, ry + F(8));
+        }
+
+        if (segs > per) listPageBtn(c, pad, pageY, W - 2 * pad, pages, battPage, 0, "battpg");
     }
 
     private void drawTips(Canvas c) {
@@ -1807,6 +1943,9 @@ public class Screen extends View {
         if ("histpg".equals(tag)) {
             // 页数在绘制时按真实行高算，这里只加一，越界由 drawPomoHistory 归零
             pomoHistPage++; invalidate(); return;
+        }
+        if ("battpg".equals(tag)) {
+            battPage++; invalidate(); return;
         }
         if ("histrange".equals(tag)) {
             if (idx >= 0 && idx < 3) { pomoHistRange = idx; pomoHistPage = 0; }
@@ -2159,7 +2298,7 @@ public class Screen extends View {
                     break;
                 }
                 case 6: mode = POMO; schedule(); invalidate(); break;
-                case 7: act.info("电量统计", battDetail()); break;
+                case 7: mode = BATT; battPage = 0; invalidate(); break;
                 case 8: mode = TIPS; invalidate(); break;
                 case 9: {
                     // 两份可选：默认只导配置，明细一天一条，几百天会把文件顶得很长
