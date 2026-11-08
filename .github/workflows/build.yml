@@ -39,20 +39,33 @@ jobs:
 
       # 签名私钥只从仓库机密读取，不落仓库（公开仓库里放 keystore 等于把签名公开）。
       # 没配 KEYSTORE_B64 也能构建，但签出来的是临时密钥，无法覆盖安装已装版本。
+      #
+      # 「Secret 没配」和「Secret 配了但解不开」必须分开报：前者是没设置，
+      # 后者是 base64 贴坏了或密码不是 android——以前两种都只说一句「用临时签名」，
+      # 结果日志里看不出到底是哪一种，只能靠猜。
       - name: 签名
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
         run: |
           rm -f debug.keystore
-          if [ -n "$KEYSTORE_B64" ]; then
-            printf '%s' "$KEYSTORE_B64" | base64 -d > debug.keystore 2>/dev/null || true
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning::Secret KEYSTORE_B64 为空（未配置）。本次用临时签名，不能覆盖安装已装版本"
+            # 标记一下，让后面的发 Release 步骤跳过：
+            # 临时签名装不上，发出去只会让人下载到一个「应用未安装」的包
+            echo "SIGNED_TEMP=1" >> "$GITHUB_ENV"
+            exit 0
           fi
-          if keytool -list -keystore debug.keystore -storepass android > /dev/null 2>&1; then
-            echo "签名就绪（与本地包可互相覆盖安装）"
-          else
+          printf '%s' "$KEYSTORE_B64" | base64 -d > debug.keystore 2>/dev/null || true
+          if ! keytool -list -keystore debug.keystore -storepass android > /dev/null 2>&1; then
+            echo "::error::KEYSTORE_B64 有内容但读不出来：不是有效 base64，或密钥库密码不是 android"
             rm -f debug.keystore
-            echo "::warning::未配置 Secret KEYSTORE_B64，本次用临时签名，不能覆盖安装"
+            exit 1
           fi
+          # 打出证书指纹：和本地 `keytool -list` 的 SHA256 比一下，
+          # 就知道 CI 用的是不是同一把钥匙（指纹是公开信息，私钥不外泄）
+          FP=$(keytool -list -v -keystore debug.keystore -storepass android 2>/dev/null \
+                | sed -n 's/^[[:space:]]*SHA256: //p' | head -n 1)
+          echo "签名就绪 SHA256: ${FP:-（读不到指纹）}"
 
       - name: 编译
         run: |
@@ -74,8 +87,9 @@ jobs:
 
       # 推到 main 且版本号是新的，就直接发 Release（tag 由 gh 自动建）。
       # 这样每次改完 versionName 推上去，Release 里就有固定下载链接，不用手动打 tag。
+      # 临时签名（SIGNED_TEMP）时跳过：那个包装不上已装版本，发出去只会让人白下载。
       - name: 发 Release（同版本已存在则跳过）
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && env.SIGNED_TEMP != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -90,7 +104,7 @@ jobs:
           fi
 
       - name: 附到 Release（打 tag 时）
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && env.SIGNED_TEMP != '1'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.APK }}

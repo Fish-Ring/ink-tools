@@ -15,6 +15,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# 脚本同时跑在 Windows(Git Bash) 与 Linux(CI) 上，而 set -u 下引用未定义变量会直接退出。
+# 这两个变量各自只在一边存在（LOCALAPPDATA 只有 Windows 有，ANDROID_SDK_ROOT 只有
+# CI 镜像常设），不先归一成空串的话，另一个平台会在变量展开处脚本直接崩掉 ——
+# 在 CI 上表现为「line 76: LOCALAPPDATA: unbound variable」，看起来像构建脚本坏了。
+: "${LOCALAPPDATA:=}"
+: "${JAVA_HOME:=}"
+: "${ANDROID_HOME:=}"
+: "${ANDROID_SDK_ROOT:=}"
+
 die() { echo "✗ $*" >&2; echo; exit 1; }
 
 # ---------------------------------------------------------------- 配置读取
