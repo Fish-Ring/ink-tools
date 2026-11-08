@@ -33,7 +33,14 @@ if [ -z "$SDK" ]; then
   done
 fi
 SDK="$(printf '%s' "$SDK" | tr '\\' '/')"
-[ -n "$SDK" ] && [ -d "$SDK" ] || die "找不到 Android SDK。设置 ANDROID_HOME，或在 local.properties 写 sdk.dir=/路径"
+if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
+  # local.properties 被 .gitignore 排除（每台机器路径不同），所以新检出 / 新目录
+  # 第一次构建必然缺它。不提示清楚的话，错误看起来像「代码坏了」。
+  die "找不到 Android SDK。设置 ANDROID_HOME，或在 local.properties 写 sdk.dir=/路径
+  （local.properties 不入库，新检出 / 换目录后需要自己创建一次，例如：
+    sdk.dir=D:/Code/Environment/Android/Sdk
+    jdk17.dir=D:/Code/Environment/Java/jdk-17）"
+fi
 
 PLATFORM="$SDK/platforms/android-34/android.jar"
 [ -f "$PLATFORM" ] || die "缺少 $PLATFORM（需要 platforms;android-34）"
@@ -150,6 +157,14 @@ PY
 echo "[7/7] 对齐并签名"
 "$ZIPALIGN" -f 4 build/unsigned.apk build/aligned.apk
 if [ ! -f debug.keystore ]; then
+  # 这个 key 不是随手可换的：设备上已装的包是拿它签的，签名不一致时
+  # adb install -r 会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE，逼你卸载重装 —— 数据全丢。
+  # 自动生成只是让「首次构建」不至于卡住，但必须让人知道刚刚换了一把钥匙。
+  echo
+  echo "!  没有 debug.keystore，已新建一把（与原包签名不同）"
+  echo "!  设备上若已装过本应用，这次装的包无法覆盖：会报签名冲突"
+  echo "!  换机器 / 新检出请从备份恢复同一个 debug.keystore，不要让它自动生成"
+  echo
   keytool -genkeypair -keystore debug.keystore \
     -storepass android -keypass android -alias androiddebugkey \
     -keyalg RSA -keysize 2048 -validity 10000 \

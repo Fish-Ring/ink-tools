@@ -109,6 +109,14 @@ sdk.dir=D:/Code/Environment/Android/Sdk
 jdk17.dir=D:/Code/Environment/Java/jdk-17
 ```
 
+`local.properties` 与 `debug.keystore` 都在 `.gitignore` 里（前者是每台机器的路径，
+后者是签名私钥），所以**新检出 / 换目录后必须自己补这两个文件**，否则构建会在
+第一步报「找不到 Android SDK」。
+
+`debug.keystore` 尤其别让它自动生成：设备上已装的包是拿它签的，签名不一致时
+`adb install -r` 会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，只能卸载重装——数据全丢。
+`build.sh` 找不到它时会新建一把并打三行警告，看到那三行说明你正踩这条线。
+
 ```bash
 ./build.sh                    # 先跑单测，再出包 eink-toolbox.apk
 bash tests/run.sh             # 只跑单测（纯 JVM，不需要设备）
