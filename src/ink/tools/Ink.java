@@ -4,12 +4,18 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 
+import java.util.HashMap;
+
 /**
  * 纯黑白绘制原语。
  *
  * 刻意关闭抗锯齿：EPD 上抗锯齿会生成灰阶边缘，既加重残影又浪费刷新。
  * 状态标记以描边 / 细线 / 勾笔画为主；仅本月打卡汇总表的小圆点用实心表示完成
  * （用户明确要求，点径极小，残影影响可忽略），其余一律不用实心填充与反白黑底。
+ *
+ * 画笔按「字号 + 粗体 + 等宽」缓存：一次 onDraw 要画上百段文字、几百个状态点，
+ * 每段都 new Paint 会让 GC 在低端设备上抖起来。缓存命中后只改颜色
+ * （OLED 反色要跟随），其余属性不变，因此调用方**不得修改**返回的 Paint。
  */
 public final class Ink {
     public static final int BLACK = 0xFF000000;
@@ -19,6 +25,12 @@ public final class Ink {
     public static int FG = BLACK;
     public static int BG = WHITE;
 
+    /** 缓存上限：字号组合本来就是有限集合，超了说明参数在乱跳，清掉重来。 */
+    private static final int CACHE_MAX = 256;
+    private static final HashMap<Long, Paint> TEXTS = new HashMap<>();
+    private static final HashMap<Integer, Paint> STROKES = new HashMap<>();
+    private static Paint FILL;
+
     public static void theme(boolean dark) {
         FG = dark ? WHITE : BLACK;
         BG = dark ? BLACK : WHITE;
@@ -26,25 +38,40 @@ public final class Ink {
 
     private Ink() {}
 
+    private static long textKey(float size, boolean bold, boolean mono) {
+        return ((long) Float.floatToIntBits(size) << 2) | (bold ? 1L : 0L) | (mono ? 2L : 0L);
+    }
+
     public static Paint text(float size, boolean bold, boolean mono) {
-        Paint p = new Paint();
-        p.setAntiAlias(false);
+        long k = textKey(size, bold, mono);
+        Paint p = TEXTS.get(k);
+        if (p == null) {
+            p = new Paint();
+            p.setAntiAlias(false);
+            p.setTextSize(size);
+            p.setTypeface(mono
+                    ? Typeface.MONOSPACE
+                    : (bold ? Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+                            : Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)));
+            if (TEXTS.size() >= CACHE_MAX) TEXTS.clear();
+            TEXTS.put(k, p);
+        }
         p.setColor(FG);
-        p.setTextSize(size);
-        Typeface tf = mono
-                ? Typeface.MONOSPACE
-                : (bold ? Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-                        : Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL));
-        p.setTypeface(tf);
         return p;
     }
 
     public static Paint stroke(float width) {
-        Paint p = new Paint();
-        p.setAntiAlias(false);
+        int k = Float.floatToIntBits(width);
+        Paint p = STROKES.get(k);
+        if (p == null) {
+            p = new Paint();
+            p.setAntiAlias(false);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(width);
+            if (STROKES.size() >= CACHE_MAX) STROKES.clear();
+            STROKES.put(k, p);
+        }
         p.setColor(FG);
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(width);
         return p;
     }
 
@@ -64,11 +91,13 @@ public final class Ink {
 
     /** 实心填充画笔：仅用于汇总表的完成圆点。 */
     public static Paint fill() {
-        Paint p = new Paint();
-        p.setAntiAlias(false);
-        p.setColor(FG);
-        p.setStyle(Paint.Style.FILL);
-        return p;
+        if (FILL == null) {
+            FILL = new Paint();
+            FILL.setAntiAlias(false);
+            FILL.setStyle(Paint.Style.FILL);
+        }
+        FILL.setColor(FG);
+        return FILL;
     }
 
     /** 完成 = 实心，未完成 = 空心描边（外径与实心一致，排列时不会显得缺一个）。 */

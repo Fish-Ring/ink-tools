@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      纯黑白弹窗主题。
+
+      默认的 Theme.Material.Light.Dialog 带蓝色 accent（单选圈、分隔线）和圆角阴影，
+      在墨水屏上会渲染成灰阶，既破坏「只有黑白」的约束，也加重残影。
+      这里把 accent 改成黑色、去掉背景调暗层（整屏变灰等于一次全刷）和圆角阴影。
+    -->
+    <style name="InkDialog" parent="@android:style/Theme.Material.Light.Dialog">
+        <item name="android:colorAccent">#FF000000</item>
+        <item name="android:colorPrimary">#FF000000</item>
+        <item name="android:colorPrimaryDark">#FF000000</item>
+        <item name="android:windowBackground">#FFFFFFFF</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:alertDialogTheme">@style/InkDialog</item>
+        <!-- 月份转盘（NumberPicker）的选中横线取 colorControlActivated / Normal：
+             默认是灰蓝，在墨水屏上会渲染成一条脏灰。统一成黑色。 -->
+        <item name="android:colorControlActivated">#FF000000</item>
+        <item name="android:colorControlNormal">#FF000000</item>
+    </style>
+
+    <!--
+      应用主题。
+
+      父主题保持原来的 Theme.NoTitleBar.Fullscreen（无标题栏、全屏），只补颜色：
+      这个老主题里没有定义 colorAccent，弹窗在某些路径上会回落到框架默认的
+      **蓝色** accent——实测月份转盘弹窗标题下面那条分隔线就是亮蓝色。
+      墨水屏上出现蓝色是不能接受的，所以在这里统一钉成黑色，
+      并把 alertDialogTheme 也指过去，避免任何一条路径漏掉。
+    -->
+    <style name="InkApp" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+        <item name="android:colorAccent">#FF000000</item>
+        <item name="android:colorPrimary">#FF000000</item>
+        <item name="android:colorPrimaryDark">#FF000000</item>
+        <item name="android:colorControlActivated">#FF000000</item>
+        <item name="android:colorControlNormal">#FF000000</item>
+        <item name="android:windowBackground">#FFFFFFFF</item>
+        <item name="android:alertDialogTheme">@style/InkDialog</item>
+    </style>
+
+    <!-- 日期选择器同理：默认主题也是蓝色 -->
+    <style name="InkDatePicker" parent="@android:style/Theme.Material.Light.Dialog">
+        <item name="android:colorAccent">#FF000000</item>
+        <!-- 日期选择器顶部那条 header 用 colorPrimary：默认是系统蓝，
+             渲到灰度屏上就是一条脏灰，比黑色更难看，也比纯黑更容易留残影 -->
+        <item name="android:colorPrimary">#FF000000</item>
+        <item name="android:colorPrimaryDark">#FF000000</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>

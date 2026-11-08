@@ -19,6 +19,8 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.DatePicker;
 import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.NumberPicker;
 import android.widget.Toast;
 
 import java.util.Calendar;
@@ -31,6 +33,13 @@ public class MainActivity extends Activity {
 
     Screen screen;
     Store store;
+
+    @Override
+    public void onBackPressed() {
+        // 子页面（电量统计 / 使用建议 / 番茄历史）先回上一级，不然一按返回就直接退出 App
+        if (screen != null && screen.back()) return;
+        super.onBackPressed();
+    }
 
     @Override
     protected void onCreate(Bundle b) {
@@ -126,7 +135,7 @@ public class MainActivity extends Activity {
         final float[] steps = Screen.FONT_STEPS;
         String[] items = new String[steps.length];
         for (int i = 0; i < steps.length; i++) items[i] = String.valueOf(steps[i]);
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.InkDialog)
                 .setTitle("字号")
                 .setSingleChoiceItems(items, screen.fontStep(),
                         new DialogInterface.OnClickListener() {
@@ -141,34 +150,28 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    /** 电量统计：一个弹窗，三条口径（今日 / 本次充电后 / 近 7 天）轮流看。 */
-    public void battDialog() {
-        final int[] at = {0};
-        final AlertDialog[] dlg = new AlertDialog[1];
-        dlg[0] = new AlertDialog.Builder(this)
-                .setTitle("电量统计　1/3")
-                .setMessage(screen.battPage(0))
-                .setNegativeButton("关闭", null)
-                .setPositiveButton("下一个 ›", null)
-                .create();
-        dlg[0].setOnShowListener(new DialogInterface.OnShowListener() {
-            @Override public void onShow(DialogInterface d) {
-                // 把「下一个」换成不关闭对话框的点击，三条口径原地切换
-                dlg[0].getButton(AlertDialog.BUTTON_POSITIVE)
-                        .setOnClickListener(new View.OnClickListener() {
-                            @Override public void onClick(View v) {
-                                at[0] = (at[0] + 1) % 3;
-                                dlg[0].setTitle("电量统计　" + (at[0] + 1) + "/3");
-                                dlg[0].setMessage(screen.battPage(at[0]));
-                            }
-                        });
-            }
-        });
-        dlg[0].show();
-    }
-
     public void toast(String s) {
         Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+    }
+
+    /** 单条文本上限：防止粘贴一整篇文章把存储和绘制拖垮。 */
+    private static final int TEXT_MAX = 200;
+    /** 批量录入上限：一次几千行会卡住主线程。 */
+    private static final int BATCH_MAX = 200;
+
+    /** 版本号只读一次：onDraw 每帧都要用，别每次都去问 PackageManager。 */
+    private String versionCache;
+
+    public String versionName() {
+        if (versionCache == null) {
+            versionCache = "";
+            try {
+                String v = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+                if (v != null) versionCache = v;
+            } catch (Exception ignored) {
+            }
+        }
+        return versionCache;
     }
 
     public void copy(String s) {
@@ -289,12 +292,16 @@ public class MainActivity extends Activity {
         et.setTextSize(16);
         et.setPadding(28, 20, 28, 20);
         if (!initial.isEmpty()) et.setSelection(initial.length());
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.InkDialog)
                 .setTitle(title)
                 .setView(et)
                 .setPositiveButton("确定", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int w) {
                         String s = et.getText().toString().trim();
+                        if (s.length() > TEXT_MAX) {
+                            s = s.substring(0, TEXT_MAX);
+                            toast("超过 " + TEXT_MAX + " 字，已截断");
+                        }
                         if (!s.isEmpty()) cb.run(s);
                     }
                 })
@@ -312,13 +319,24 @@ public class MainActivity extends Activity {
         et.setGravity(Gravity.TOP);
         et.setTextSize(15);
         et.setPadding(28, 20, 28, 20);
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.InkDialog)
                 .setTitle(title)
                 .setView(et)
                 .setPositiveButton("确定", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int w) {
                         String s = et.getText().toString();
-                        if (!s.trim().isEmpty()) cb.run(s);
+                        if (s.trim().isEmpty()) return;
+                        String[] lines = s.split("\\r?\\n");
+                        if (lines.length > BATCH_MAX) {
+                            StringBuilder b = new StringBuilder();
+                            for (int i = 0; i < BATCH_MAX; i++) {
+                                if (i > 0) b.append('\n');
+                                b.append(lines[i]);
+                            }
+                            s = b.toString();
+                            toast("一次最多 " + BATCH_MAX + " 条，已截断");
+                        }
+                        cb.run(s);
                     }
                 })
                 .setNegativeButton("取消", null)
@@ -327,7 +345,7 @@ public class MainActivity extends Activity {
 
     /** 选择菜单：编辑条目时区分「改名称 / 改日期 / 删除」。 */
     public void choose(String title, CharSequence[] items, final Icb cb) {
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.InkDialog)
                 .setTitle(title)
                 .setItems(items, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int w) { cb.run(w); }
@@ -343,7 +361,7 @@ public class MainActivity extends Activity {
     public void pickDate(long initial, final Cb cb) {
         final Calendar c = Calendar.getInstance();
         c.setTimeInMillis(initial);
-        new DatePickerDialog(this, new DatePickerDialog.OnDateSetListener() {
+        new DatePickerDialog(this, R.style.InkDatePicker, new DatePickerDialog.OnDateSetListener() {
             @Override public void onDateSet(DatePicker view, int y, int m, int d) {
                 Calendar x = Calendar.getInstance();
                 x.set(y, m, d, 0, 0, 0);
@@ -354,9 +372,70 @@ public class MainActivity extends Activity {
                 c.get(Calendar.DAY_OF_MONTH)).show();
     }
 
+    /**
+     * 只选「年 + 月」的转盘。
+     *
+     * 为什么不用系统 DatePickerDialog：
+     * 它默认是**日历网格**（整月 30 个格子一个一个点），而且头部是一条亮蓝色的条。
+     * 试过用主题把它改成 spinner（datePickerMode=spinner），这台 ROM 完全不理，
+     * 颜色也盖不住——墨水屏上出现一条蓝条是绝对不能接受的。
+     * 所以这里用系统的 NumberPicker 自己拼两个转盘：同样是「系统转盘」的手感，
+     * 但只有黑白两色，也不会多出「日」那一列。
+     *
+     * @param ym 初始 yyyyMM（0 或负数表示用当前月）
+     */
+    public void pickMonth(int ym, final Icb cb) {
+        Calendar c = Calendar.getInstance();
+        if (ym > 0) {
+            c.set(Calendar.YEAR, ym / 100);
+            c.set(Calendar.MONTH, ym % 100 - 1);
+        }
+        final int curY = c.get(Calendar.YEAR), curM = c.get(Calendar.MONTH) + 1;
+
+        NumberPicker yp = new NumberPicker(this);
+        yp.setMinValue(MIN_YEAR);
+        yp.setMaxValue(MAX_YEAR);
+        yp.setValue(Math.max(MIN_YEAR, Math.min(MAX_YEAR, curY)));
+        yp.setFormatter(new NumberPicker.Formatter() {
+            @Override public String format(int v) { return v + " 年"; }
+        });
+
+        NumberPicker mp = new NumberPicker(this);
+        mp.setMinValue(1);
+        mp.setMaxValue(12);
+        mp.setValue(curM);
+        mp.setFormatter(new NumberPicker.Formatter() {
+            @Override public String format(int v) { return v + " 月"; }
+        });
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+        // 转盘自己抢焦点会弹输入法（NumberPicker 支持手输），直接封掉
+        row.setDescendantFocusability(LinearLayout.FOCUS_BLOCK_DESCENDANTS);
+        row.addView(yp, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(mp, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        int padPx = (int) (20 * getResources().getDisplayMetrics().density);
+        row.setPadding(padPx, padPx / 2, padPx, 0);
+
+        new AlertDialog.Builder(this, R.style.InkDialog)
+                .setTitle("按月份查看")
+                .setView(row)
+                .setPositiveButton("确定", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int w) {
+                        cb.run(yp.getValue() * 100 + mp.getValue());
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 月份转盘的年份范围：够宽，但不至于拨到荒唐的年份。 */
+    private static final int MIN_YEAR = 2000, MAX_YEAR = 2100;
+
     /** 纯展示：只有一个「知道了」，避免为了一条说明引出一串交互。 */
     public void info(String title, String msg) {
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.InkDialog)
                 .setTitle(title)
                 .setMessage(msg)
                 .setPositiveButton("知道了", null)
@@ -364,7 +443,7 @@ public class MainActivity extends Activity {
     }
 
     public void confirm(String title, String msg, final Runnable ok) {
-        new AlertDialog.Builder(this)
+        new AlertDialog.Builder(this, R.style.InkDialog)
                 .setTitle(title)
                 .setMessage(msg)
                 .setPositiveButton("确定", new DialogInterface.OnClickListener() {

@@ -8,3 +8,9 @@ build/
 *.keystore
 *.jks
 *.p12
+
+# 本机 SDK / JDK 路径（每台机器不同）
+local.properties
+
+# 智能体工作区（本地记忆，不入库）
+.workbuddy/

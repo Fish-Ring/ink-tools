@@ -34,16 +34,18 @@ public final class Store {
     }
 
     public static final class Habit {
+        public String id = "";                   // 稳定标识：改名后历史仍跟得上
         public String name;
         public int streak;
         public final boolean[] days = new boolean[32];
+        /** 每个日期打卡的时刻：0 未打卡 / -1 打过卡但无时间 / 其余见 HabitTime。 */
+        public int[] mins = new int[32];
         public Habit(String n) { name = n; }
-    }
-
-    public static final class Day {
+    }    public static final class Day {
         public String name;
         public long millis;
         public boolean pinned;                 // 置顶到台历右上角，全列表唯一
+        public boolean onClock;                // 在时钟页数字下方显示，全列表唯一
         public Day(String n, long m) { name = n; millis = m; }
     }
 
@@ -71,32 +73,38 @@ public final class Store {
     private long pomoDoneDay;
     private int habitMonth;                   // yyyyMM，用于跨月清空打卡格
 
-    // ---------------------------------------------------------------- 电量统计
     /**
-     * 一个统计口径的累加器。只存「当前这一次」，不留历史明细。
+     * 打卡历史归档：跨月时把当月位图另存一份，历史按月回看靠它。
      *
-     * start 是这一轮从几点起算，last 是上一次采样时刻，pct 是上一次采样到的电量，
-     * ms / drop 是累计的「有效使用时长」和「有效掉电」。
-     *
-     * 累计只在两次采样间隔不超过 BATT_GAP 时进行：超过就判定中间离开了，
-     * 时长与掉电都不加，只把 last / pct 挪到当前。挪 pct 这一步最关键——
-     * 离开一晚掉了 20%，若不挪，回来第一分钟就会把这 20% 算成消耗。
+     * 以前 Habit.days[]/mins[] 跨月直接清空，上个月的记录在磁盘上就不存在了，
+     * 「按月查看历史」连数据都没有。现在每月结束归档一次，旧数据只增不减。
      */
-    public static final class BattAcc {
-        public long day;                 // 归档日桶用：yyyyMMdd
-        public long start, last;
-        public int pct = -1;
-        public int from = -1;            // 起点电量，用于「90% → 87%」这种展示
-        public long ms;
-        public int drop;
+    private final ArrayList<HabitArchive.Month> habitArch = new ArrayList<>();
+    private boolean habitArchDirty;            // 归档变了才落盘，别每次打卡都重写一遍大字符串
+    private int nextHabitId = 1;               // 习惯 id 计数器（改名不影响历史归属）
+    private boolean idDirty;                   // 老数据补 id 后需要落盘
+
+    /** 习惯 id：稳定标识。改名后历史仍跟得上，删除后历史仍在（用归档里的旧名）。 */
+    public String newHabitId() {
+        return "h" + (nextHabitId++);
     }
 
-    /** 两次采样间隔超过这个值就算离开。tick 对齐整分钟，正常间隔 60.02 秒，留足抖动余量。 */
-    public static final long BATT_GAP = 100000L;
+    // ---------------------------------------------------------------- 电量统计
+    // 累加算法在 BattMath（纯逻辑、桌面 JVM 可单测）；这里只负责跨天归档、
+    // 充电状态翻转与落盘。
+    //
+    // 关键点：充电检测不依赖「App 正在运行」。电量上升就判定为中间充过电，
+    // 所以「插着电充到满、期间没打开 App」也能正确结束上一轮。
 
-    public BattAcc battToday = new BattAcc();      // 今天
-    public BattAcc battCharge = new BattAcc();     // 本次充电后（拔电起算）
-    public final ArrayList<BattAcc> battArch = new ArrayList<>();   // 归档日桶，最多 6 条
+    public BattMath.Acc battToday = new BattMath.Acc();      // 今天
+    public BattMath.Acc battCharge = new BattMath.Acc();     // 本次充电后（拔电起算）
+    /**
+     * 全时段累加：从第一次开始统计起一直加，跨天、跨充电都不清零。
+     * 只存「合计 + 起算日」，不存明细——电量只有 1% 粒度，逐年明细没有信息量。
+     */
+    public BattMath.Acc battAll = new BattMath.Acc();
+    public long battFirst;                                   // 全时段起算日 yyyyMMdd
+    public final ArrayList<BattMath.Acc> battArch = new ArrayList<>();   // 归档日桶，最多 6 条
     public boolean battCharging = false;
     private long battDay;                          // 今日累加器属于哪一天
     private long battSavedAt;
@@ -119,6 +127,8 @@ public final class Store {
         pomoDoneToday = p.getInt("pd", 0);
         pomoDoneDay = p.getLong("pdd", 0);
         habitMonth = p.getInt("hm", 0);
+        nextHabitId = p.getInt("hi", 1);
+        loadHabitArch(p.getString("ha", ""));
         loadPomoHist(p.getString("ph", ""));
         loadBatt(p.getString("bt1", ""), p.getString("bt2", ""), p.getString("bt7", ""),
                 p.getLong("btd", 0), p.getBoolean("btc", false), p.getBoolean("bts", false));
@@ -135,7 +145,8 @@ public final class Store {
         String j = p.getString("data", "");
         if (j.isEmpty()) samples();
         else load(j);                          // 加载失败也绝不覆盖用户数据
-        if (rolloverIfNeeded()) save();
+        syncNextHabitId();
+        if (rolloverIfNeeded() || idDirty) save();
     }
 
     /** yyyyMMdd，用于「今日」判定与跨天重置统计。 */
@@ -144,6 +155,16 @@ public final class Store {
         return c.get(Calendar.YEAR) * 10000L
                 + (c.get(Calendar.MONTH) + 1) * 100L
                 + c.get(Calendar.DAY_OF_MONTH);
+    }
+
+    /** 相对今天偏移 offset 天的 yyyyMMdd（-1 = 昨天）。 */
+    public static long dayYmd(int offset) {
+        return DayMath.offset(Calendar.getInstance(), offset);
+    }
+
+    /** ymd 是否落在本周（周一至周日）。待办「本周」分类用。 */
+    public static boolean inThisWeek(long ymd) {
+        return DayMath.inWeek(Calendar.getInstance(), ymd);
     }
 
     public static int dayOfMonth() {
@@ -235,26 +256,47 @@ public final class Store {
             }
             JSONArray hs = o.optJSONArray("habits");
             if (hs != null) {
+                // 习惯 id：老数据没有，补一个并立刻存回去，以后改名不影响历史归属。
+                // 发号前先把「已被占用的号」登记一遍：存档里已有的号 + 归档里的历史号
+                // （那些习惯可能已删除，但历史还在，号不能复用），
+                // 否则老存档缺 id 的习惯会拿到一个已被占用的号 →
+                // 两个习惯同 id → 打卡历史串到错的习惯上。
+                // 与 restore() 同一套规则（HabitIds）。
+                ArrayList<String> fileIds = new ArrayList<>();
+                for (int i = 0; i < hs.length(); i++) {
+                    fileIds.add(hs.getJSONObject(i).optString("i", ""));
+                }
+                int reserved = HabitIds.maxNumOfMonths(habitArch);
+                ArrayList<String> newIds = HabitIds.assign(fileIds, nextHabitId, reserved);
+                nextHabitId = Math.max(nextHabitId, HabitIds.maxNum(newIds) + 1);
                 for (int i = 0; i < hs.length(); i++) {
                     JSONObject x = hs.getJSONObject(i);
                     Habit h = new Habit(x.optString("n", ""));
                     h.streak = x.optInt("s", 0);
+                    h.id = newIds.get(i);
+                    if (!h.id.equals(fileIds.get(i))) idDirty = true;
                     String bits = x.optString("b", "");
                     for (int k = 0; k < 31 && k < bits.length(); k++) {
                         h.days[k + 1] = bits.charAt(k) == '1';
                     }
+                    // 没有 m 键就是老数据：按位串迁移成「已打卡 / 时间未知」
+                    String ms = x.optString("m", "");
+                    h.mins = ms.isEmpty() ? HabitTime.migrate(bits) : HabitTime.decode(ms);
                     habits.add(h);
                 }
             }
             JSONArray ds = o.optJSONArray("days");
             if (ds != null) {
-                boolean seen = false;
+                boolean seen = false, seenClock = false;
                 for (int i = 0; i < ds.length(); i++) {
                     JSONObject x = ds.getJSONObject(i);
                     Day d = new Day(x.optString("n", ""), x.optLong("m", 0));
                     boolean want = x.optBoolean("p", false) && !seen;
                     d.pinned = want;
                     if (want) seen = true;
+                    boolean wantClock = x.optBoolean("c", false) && !seenClock;
+                    d.onClock = wantClock;
+                    if (wantClock) seenClock = true;
                     days.add(d);
                 }
             }
@@ -276,12 +318,26 @@ public final class Store {
         return p != null ? p : (days.isEmpty() ? null : days.get(0));
     }
 
+    /** 唯一的「时钟页倒数」事件；没有则返回 null。与台历置顶互不干扰。 */
+    public Day clockDay() {
+        for (Day d : days) if (d.onClock) return d;
+        return null;
+    }
+
     /** 置顶的唯一写入口：先清全部，再按对象身份切换（不受增删导致的下标漂移影响）。 */
     public void togglePin(Day d) {
         if (d == null || days.indexOf(d) < 0) return;
         boolean on = !d.pinned;
         for (Day x : days) x.pinned = false;
         d.pinned = on;
+    }
+
+    /** 时钟页倒数的唯一写入口：独立于置顶，允许台历显示 A、时钟显示 B。 */
+    public void toggleClockDay(Day d) {
+        if (d == null || days.indexOf(d) < 0) return;
+        boolean on = !d.onClock;
+        for (Day x : days) x.onClock = false;
+        d.onClock = on;
     }
 
     // ------------------------------------------------------------ 番茄统计
@@ -442,7 +498,7 @@ public final class Store {
     public int pomoTotalRounds() { return pomoAllRounds; }
     public int pomoTotalMinutes() { return pomoAllMinutes; }
 
-    /** 跨天重置今日番茄轮数；跨月清空打卡格。返回是否有变化。 */
+    /** 跨天重置今日番茄轮数；跨月把当月打卡位图归档后清空。返回是否有变化。 */
     public boolean rolloverIfNeeded() {
         boolean changed = false;
         long t = today();
@@ -455,12 +511,98 @@ public final class Store {
         int hm = c.get(Calendar.YEAR) * 100 + (c.get(Calendar.MONTH) + 1);
         if (habitMonth != hm) {
             if (habitMonth != 0) {
-                for (Habit h : habits) java.util.Arrays.fill(h.days, false);
+                // 归档：这个月的位图是 habitMonth 那个月的，不存下来就永远没了
+                HabitArchive.merge(habitArch, snapshotMonth(habitMonth));
+                HabitArchive.trim(habitArch);
+                habitArchDirty = true;
+                for (Habit h : habits) {
+                    java.util.Arrays.fill(h.days, false);
+                    java.util.Arrays.fill(h.mins, HabitTime.NONE);
+                }
             }
             habitMonth = hm;
             changed = true;
         }
+        // 归档里若还留着「当前月」，把它并回活位图。
+        // 放在最后：跨月清空位图之后活位图是空的，正是要把归档里的当月补回来的时候。
+        if (reconcileHabitMonth()) changed = true;
         return changed;
+    }
+
+    /**
+     * 归档与活位图的对账：把归档里「当前月」的数据并回活位图，并把归档里当月那条删掉。
+     *
+     * 为什么会不一致：系统时间往回拨又拨回来时（11 月 → 10 月 → 11 月），
+     * 同一个 11 月被切成两段，跨月时第一段进了归档、活位图被清空；
+     * 拨回 11 月后归档里留着当月数据、活位图却是空的——
+     * 打卡页说「本月 0 次」、记录页说当月有记录，两页自相矛盾。
+     *
+     * 归档的语义是「已经结束的月」，当前月永远是活的：
+     * 所以归档里当月的数据要并回活位图（并集，不覆盖用户新打的卡），
+     * 且归档里当月那条要移除——否则同一个月两处数据不一致的问题会一直在。
+     *
+     * 合并规则在 HabitArchive.restoreInto（纯逻辑，可单测）。
+     */
+    private boolean reconcileHabitMonth() {
+        if (habitMonth <= 0) return false;
+        ArrayList<HabitArchive.Slot> slots = habitSlots();
+        // 归档里没有当月 → 什么都不动（别误删别的月份）
+        if (!HabitArchive.reconcileMonth(habitArch, habitMonth, slots)) return false;
+        slotsToHabits(slots);
+        habitArchDirty = true;                 // 归档变了，要写盘
+        return true;
+    }
+
+    /** 把当前习惯位图打包成某个月的归档记录。 */
+    private HabitArchive.Month snapshotMonth(int ym) {
+        return HabitArchive.snapshot(ym, habitSlots());
+    }
+
+    /**
+     * 当前习惯 → 活位图槽位。
+     *
+     * 只是搬数据，规则（编解码 / 合并）都在 HabitArchive 里，
+     * 这样「归档 ↔ 活位图」的语义能脱离 android.* 单测。
+     */
+    private ArrayList<HabitArchive.Slot> habitSlots() {
+        ArrayList<HabitArchive.Slot> slots = new ArrayList<>();
+        for (Habit h : habits) {
+            HabitArchive.Slot s = new HabitArchive.Slot();
+            s.id = h.id == null ? "" : h.id;
+            s.name = h.name == null ? "" : h.name;
+            System.arraycopy(h.days, 0, s.days, 0, Math.min(h.days.length, s.days.length));
+            System.arraycopy(h.mins, 0, s.mins, 0, Math.min(h.mins.length, s.mins.length));
+            slots.add(s);
+        }
+        return slots;
+    }
+
+    /** 槽位写回习惯（恢复合并后用）。 */
+    private void slotsToHabits(ArrayList<HabitArchive.Slot> slots) {
+        for (int i = 0; i < habits.size() && i < slots.size(); i++) {
+            Habit h = habits.get(i);
+            HabitArchive.Slot s = slots.get(i);
+            System.arraycopy(s.days, 0, h.days, 0, Math.min(s.days.length, h.days.length));
+            System.arraycopy(s.mins, 0, h.mins, 0, Math.min(s.mins.length, h.mins.length));
+        }
+    }
+
+    /**
+     * 所有有数据的月份（含当前月），按 ym 从大到小。
+     * 当前月是活的（还在打卡），历史月来自归档。
+     */
+    public ArrayList<HabitArchive.Month> habitMonths() {
+        HabitArchive.Month cur = snapshotMonth(habitMonth > 0 ? habitMonth : currentYm());
+        // 当前月与归档里同月时不是「替换」而是「合并」（按位取并集）：
+        // 系统时间往回拨又拨回来时，同一个月会被切成两段（11 月 → 10 月 → 11 月），
+        // 归档里存着第一段、活着的位图是第二段，只留一段就是丢数据。
+        return HabitArchive.view(habitArch, cur);
+    }
+
+    /** 当前月键 yyyyMM。 */
+    public static int currentYm() {
+        Calendar c = Calendar.getInstance();
+        return c.get(Calendar.YEAR) * 100 + c.get(Calendar.MONTH) + 1;
     }
 
     public String exportJson() {
@@ -529,6 +671,9 @@ public final class Store {
             if (data.has("todos")) o.put("todos", data.get("todos"));
             if (data.has("habits")) o.put("habits", data.get("habits"));
             if (data.has("days")) o.put("days", data.get("days"));
+            // 打卡历史归档也进备份：换机后不该只剩当月
+            String arch = p.getString("ha", "");
+            if (!arch.isEmpty()) o.put("habitArch", arch);
             return o.toString(2);
         } catch (Exception e) {
             return "";
@@ -585,13 +730,29 @@ public final class Store {
 
             ArrayList<Habit> nh = new ArrayList<>();
             JSONArray hs = o.optJSONArray("habits");
+            // 先把备份里已占用的习惯 id 登记一遍：老备份缺 id 的习惯要在这里发新号，
+            // 新号必须避开备份里已有的号，否则两个习惯同 id，打卡历史会串到错的习惯上。
+            ArrayList<String> fileIds = new ArrayList<>();
+            if (hs != null) {
+                for (int i = 0; i < hs.length(); i++) {
+                    fileIds.add(hs.getJSONObject(i).optString("i", ""));
+                }
+            }
+            // 归档里的 id 也要避开：那些习惯可能已删除，但历史还在（用旧名兜底）
+            int reserved = HabitIds.maxNumOfMonths(HabitArchive.decode(o.optString("habitArch", "")));
+            ArrayList<String> newIds = HabitIds.assign(fileIds, nextHabitId, reserved);
+            nextHabitId = Math.max(nextHabitId, HabitIds.maxNum(newIds) + 1);
             if (hs != null) {
                 for (int i = 0; i < hs.length(); i++) {
                     JSONObject x = hs.getJSONObject(i);
                     Habit h = new Habit(x.optString("n", ""));
                     h.streak = x.optInt("s", 0);
+                    h.id = newIds.get(i);
+                    if (!h.id.equals(fileIds.get(i))) idDirty = true;
                     String bits = x.optString("b", "");
                     for (int k = 0; k < 31 && k < bits.length(); k++) h.days[k + 1] = bits.charAt(k) == '1';
+                    String ms = x.optString("m", "");
+                    h.mins = ms.isEmpty() ? HabitTime.migrate(bits) : HabitTime.decode(ms);
                     nh.add(h);
                 }
             }
@@ -599,11 +760,15 @@ public final class Store {
             ArrayList<Day> nd = new ArrayList<>();
             JSONArray ds = o.optJSONArray("days");
             if (ds != null) {
-                boolean seen = false;
+                boolean seen = false, seenClock = false;
                 for (int i = 0; i < ds.length(); i++) {
                     JSONObject x = ds.getJSONObject(i);
                     Day d = new Day(x.optString("n", ""), x.optLong("m", 0));
                     if (x.optBoolean("p", false) && !seen) { d.pinned = true; seen = true; }
+                    if (x.optBoolean("c", false) && !seenClock) {
+                        d.onClock = true;
+                        seenClock = true;
+                    }
                     nd.add(d);
                 }
             }
@@ -656,6 +821,11 @@ public final class Store {
             Calendar c = Calendar.getInstance();
             habitMonth = c.get(Calendar.YEAR) * 100 + c.get(Calendar.MONTH) + 1;
 
+            // 历史归档：只认备份里带来的，没有就清空（不能留旧机器的）
+            loadHabitArch(o.optString("habitArch", ""));
+            habitArchDirty = true;
+            syncNextHabitId();
+
             save();
             return true;
         } catch (Exception e) {
@@ -698,7 +868,8 @@ public final class Store {
     /**
      * 每分钟跟着 tick 采一次，start / stop 也各调一次，把前后台边界对齐。
      *
-     * 三条口径共用同一套累加：今日、本次充电后、近 7 天（归档日桶 + 今日）。
+     * 三次口径共用同一套未充电累加（今日、本次充电后、全时段），
+     * 近 7 天由归档日桶 + 今日算出；总时长（含充电）由 gross() 单独维护。
      * 不记明细、不新增定时器——电量本身只有 1% 粒度，写得再密也没有多余信息。
      */
     public void battTick(int pct, boolean charging) {
@@ -707,14 +878,20 @@ public final class Store {
         long day = today();
         boolean dirty = false;
 
-        // 跨天：把昨天这一桶归档，今天重新开一桶
+        // 跨天：把昨天这一桶归档，今天重新开一桶。
+        // 归档门槛也要看 msAll：只插着电用过、没掉过电的那一天 ms=0 但确实有使用。
         if (battDay != day) {
-            if (battToday.pct >= 0 && battToday.ms >= 60000L) {
+            if (battToday.seeded()
+                    && (battToday.ms >= 60000L || battToday.msAll >= 60000L)) {
                 battToday.day = battDay;
                 battArch.add(battToday);
                 while (battArch.size() > 6) battArch.remove(0);
             }
-            battToday = new BattAcc();
+            battToday = new BattMath.Acc();
+            // 必须在这里立刻起算：旧代码靠下面 today() 里的隐式 seed 补，
+            // 而跨天当天若一直插着电，today() 根本不会被调用（charging 早退）；
+            // 等拔电后再补 seed，就会把这天已经攒下的 msAll 清零。
+            BattMath.seed(battToday, now, pct);
             battDay = day;
             dirty = true;
         }
@@ -722,75 +899,109 @@ public final class Store {
         if (!battSeeded) {
             battSeeded = true;
             battCharging = charging;
-            seed(battToday, now, pct);
-            if (!charging) seed(battCharge, now, pct);
+            BattMath.seed(battToday, now, pct);
+            if (!charging) BattMath.seed(battCharge, now, pct);
+            // 全时段口径从这一天起算；已有数据时不要覆盖起算日
+            if (!battAll.seeded()) BattMath.seed(battAll, now, pct);
+            if (battFirst <= 0) battFirst = day;
             dirty = true;
         } else if (charging != battCharging) {
             battCharging = charging;
-            if (charging) battCharge = new BattAcc();     // 插电：这一轮到此为止
-            else seed(battCharge, now, pct);              // 拔电：新一轮从这里起算
+            if (charging) {
+                battCharge = new BattMath.Acc();   // 插电：这一轮到此为止
+            } else {
+                BattMath.seed(battCharge, now, pct);   // 拔电：新一轮从这里起算
+            }
             dirty = true;
         }
 
+        // 全时段口径起算日。旧版本没有 btf 键、却已经把 bts=true 落过盘，
+        // 升级后 !battSeeded 分支永远不进，battFirst 会一直是 0 →
+        // 「全部」页显示「已统计 0 天 / 每月约 0 小时」。所以每次 tick 都兜一次底。
+        if (battFirst <= 0) {
+            long archFirst = 0;
+            for (BattMath.Acc a : battArch) {
+                if (a.day > 0 && (archFirst == 0 || a.day < archFirst)) archFirst = a.day;
+            }
+            battFirst = archFirst > 0 ? archFirst : day;
+            dirty = true;
+        }
+
+        // 「含充电总时长」：无论是否插电，只要 App 在前台且采样间隔正常就累计。
+        // 必须放在上面的跨天 / seed / 充电翻转之后（那些操作会替换 Acc 对象），
+        // 又要放在 charging 早退之前——旧版正是在这里直接 return，
+        // 插着电使用的时间既没进 ms（正确）也没进任何总时长（缺口）。
+        // 总时长只在内存里累加，不额外触发落盘：ms 本来也是靠掉电变化或 5 分钟兜底写盘，
+        // 每分钟 apply() 一次对墨水屏是纯粹的耗电，没必要为了 1 分钟精度多写 5 倍。
+        BattMath.gross(battToday, now);
+        if (battCharge.seeded()) BattMath.gross(battCharge, now);
+        BattMath.gross(battAll, now);
+
         if (charging) {
+            // 充电中「未充电使用时长」与掉电都不累计（这一轮到此为止），
+            // 但上面的 gross() 已经把这段前台时间记进了含充电总时长。
+            // 电量变化仍要在下一次采样被 today() 看到，靠「电量上升」结束上一轮
+            //（App 没运行时同样成立）。
             if (dirty || now - battSavedAt > 5L * 60000L) saveBatt();
             return;
         }
 
-        boolean dropCh = step(battToday, now, pct);
-        if (battCharge.pct >= 0) dropCh |= step(battCharge, now, pct);
+        boolean ch = BattMath.today(battToday, now, pct);
+        if (battCharge.seeded()) ch |= BattMath.charge(battCharge, now, pct);
+        // 全时段用 today()：充电只挪基点、不清零（用掉的电是真实消耗）
+        ch |= BattMath.today(battAll, now, pct);
 
-        if (dirty || dropCh || now - battSavedAt > 5L * 60000L) saveBatt();
+        if (dirty || ch || now - battSavedAt > 5L * 60000L) saveBatt();
     }
 
-    private static void seed(BattAcc a, long now, int pct) {
-        a.start = now;
-        a.last = now;
-        a.pct = pct;
-        a.from = pct;
-        a.ms = 0;
-        a.drop = 0;
+    /** 近 7 天的每日使用量（柱子用）。 */
+    public static final class DayPoint {
+        public long day;
+        public long ms;       // 未充电时长
+        public long msAll;    // 含充电总时长
+
+        public DayPoint(long d, long m, long a) { day = d; ms = m; msAll = a; }
     }
 
-    /** 累计一段，返回累计值是否变了。 */
-    private static boolean step(BattAcc a, long now, int pct) {
-        if (a.pct < 0) { seed(a, now, pct); return true; }
-        long gap = now - a.last;
-        if (gap < 0 || gap > BATT_GAP) {
-            // 判定离开：不累加，只滑动基点。start 保持不动，
-            // 这样「累计 60 分」和「从 10:30 起算」可以同时成立。
-            a.last = now;
-            a.pct = pct;
-            return true;
+    /**
+     * 近 7 天每天的使用时长，按日期升序返回（最多 7 条，最后一条是今天）。
+     * 归档桶只留 6 天，加今天正好 7 天；缺的日子不补，返回的条数可能少于 7。
+     */
+    public ArrayList<DayPoint> batt7Daily() {
+        ArrayList<DayPoint> out = new ArrayList<>();
+        Calendar c = Calendar.getInstance();
+        for (int i = 6; i >= 0; i--) {
+            long d = DayMath.offset(c, -i);
+            long ms = 0, msAll = 0;
+            // 今天这一桶的 day 字段从来没被赋值（跨天归档时写的是**旧**对象，
+            // 新的 battToday 是 new Acc()，day=0），所以要用 battDay 判断今天。
+            // 旧代码拿 battToday.day 比，等于把今天这一格永远画成 0。
+            if (battDay == d) {
+                ms = battToday.ms;
+                msAll = battToday.msAll;
+            } else {
+                for (BattMath.Acc a : battArch) {
+                    if (a.day == d) { ms = a.ms; msAll = a.msAll; break; }
+                }
+            }
+            out.add(new DayPoint(d, ms, msAll));
         }
-        // 时长每分钟都在涨，不能拿它当写盘信号，否则一天要写 1440 次。
-        // 只有「掉电变了」才立刻落盘，时长靠 5 分钟的兜底保存 —— 进程被杀最多丢 5 分钟。
-        boolean ch = false;
-        if (gap >= 1500L) a.ms += gap;
-        if (pct < a.pct) { a.drop += a.pct - pct; ch = true; }
-        a.last = now;
-        a.pct = pct;
-        return ch;
+        return out;
     }
 
-    /** 近 7 天：归档日桶（6 天内）+ 今天的实时值。 */
-    public long batt7Ms() {
-        long s = battToday.ms;
-        for (BattAcc a : battArch) if (within7(a.day)) s += a.ms;
-        return s;
-    }
+    /** 全时段累计使用时长（未充电）。 */
+    public long battAllMs() { return battAll.ms; }
 
-    public int batt7Drop() {
-        int s = battToday.drop;
-        for (BattAcc a : battArch) if (within7(a.day)) s += a.drop;
-        return s;
-    }
+    /** 全时段累计前台总时长（含充电）。 */
+    public long battAllMsAll() { return battAll.msAll; }
 
-    private static boolean within7(long day) {
-        // yyyyMMdd 直接相减在跨月时是错的（20261101 - 20261031 = 70），先换成天序号
-        long t = today();
-        if (day <= 0 || day > t) return false;
-        return dayNum(t) - dayNum(day) <= 6;
+    /** 全时段累计掉电。 */
+    public int battAllDrop() { return battAll.drop; }
+
+    /** 全时段已经统计了多少天（含起算日，至少 1）。 */
+    public int battAllDays() {
+        if (battFirst <= 0) return 0;
+        return (int) Math.max(1L, dayNum(today()) - dayNum(battFirst) + 1);
     }
 
     private static long dayNum(long ymd) {
@@ -800,15 +1011,41 @@ public final class Store {
         return c.getTimeInMillis() / 86400000L;
     }
 
+    /** 近 7 天：归档日桶（6 天内）+ 今天的实时值。 */
+    public long batt7Ms() {
+        long s = battToday.ms;
+        for (BattMath.Acc a : battArch) if (within7(a.day)) s += a.ms;
+        return s;
+    }
+
+    /** 近 7 天含充电的前台总时长。 */
+    public long batt7MsAll() {
+        long s = battToday.msAll;
+        for (BattMath.Acc a : battArch) if (within7(a.day)) s += a.msAll;
+        return s;
+    }
+
+    public int batt7Drop() {
+        int s = battToday.drop;
+        for (BattMath.Acc a : battArch) if (within7(a.day)) s += a.drop;
+        return s;
+    }
+
+    private static boolean within7(long day) {
+        return BattMath.withinDays(day, today(), 7);
+    }
+
     private void saveBatt() {
         battSavedAt = System.currentTimeMillis();
         try {
             JSONArray arch = new JSONArray();
-            for (BattAcc a : battArch) arch.put(accJson(a));
+            for (BattMath.Acc a : battArch) arch.put(accJson(a));
             p.edit()
                     .putString("bt1", accJson(battToday).toString())
                     .putString("bt2", accJson(battCharge).toString())
                     .putString("bt7", arch.toString())
+                    .putString("bt9", accJson(battAll).toString())
+                    .putLong("btf", battFirst)
                     .putLong("btd", battDay)
                     .putBoolean("btc", battCharging)
                     .putBoolean("bts", battSeeded)
@@ -817,7 +1054,7 @@ public final class Store {
         }
     }
 
-    private static JSONObject accJson(BattAcc a) throws Exception {
+    private static JSONObject accJson(BattMath.Acc a) throws Exception {
         JSONObject o = new JSONObject();
         o.put("d", a.day);
         o.put("s", a.start);
@@ -825,12 +1062,15 @@ public final class Store {
         o.put("p", a.pct);
         o.put("f", a.from);
         o.put("m", a.ms);
+        o.put("a", a.msAll);
+        o.put("A", a.lastAll);
         o.put("r", a.drop);
+        o.put("c", a.charged);
         return o;
     }
 
-    private static BattAcc accFrom(String s) {
-        BattAcc a = new BattAcc();
+    private static BattMath.Acc accFrom(String s) {
+        BattMath.Acc a = new BattMath.Acc();
         try {
             JSONObject o = new JSONObject(s);
             a.day = o.optLong("d", 0);
@@ -839,15 +1079,24 @@ public final class Store {
             a.pct = o.optInt("p", -1);
             a.from = o.optInt("f", -1);
             a.ms = o.optLong("m", 0);
+            a.msAll = o.optLong("a", 0);
+            a.lastAll = o.optLong("A", 0);
             a.drop = o.optInt("r", 0);
+            a.charged = o.optBoolean("c", false);
+            // 升级前没有 a / A 两个键：总时长至少要等于未充电时长
+            BattMath.migrate(a);
         } catch (Exception ignored) {
         }
         return a;
     }
 
     private void loadBatt(String s1, String s2, String s7, long day, boolean charging, boolean seeded) {
+        battArch.clear();
         if (s1 != null && !s1.isEmpty()) battToday = accFrom(s1);
         if (s2 != null && !s2.isEmpty()) battCharge = accFrom(s2);
+        String s9 = p.getString("bt9", "");
+        if (!s9.isEmpty()) battAll = accFrom(s9);
+        battFirst = p.getLong("btf", 0);
         battDay = day;
         battCharging = charging;
         battSeeded = seeded;
@@ -867,15 +1116,39 @@ public final class Store {
         pomoHist.clear();
         pomoAllRounds = 0;
         pomoAllMinutes = 0;
-        battToday = new BattAcc();
-        battCharge = new BattAcc();
+        habitArch.clear();
+        habitArchDirty = true;
+        battToday = new BattMath.Acc();
+        battCharge = new BattMath.Acc();
+        battAll = new BattMath.Acc();
+        battFirst = 0;
         battArch.clear();
         battDay = today();
+        battSavedAt = 0;
         battSeeded = false;
         battCharging = false;
-        p.edit().remove("bt1").remove("bt2").remove("bt7")
+        p.edit().remove("bt1").remove("bt2").remove("bt7").remove("bt9").remove("btf")
                 .remove("btd").remove("btc").remove("bts").remove("btl").apply();
+        // 清空后习惯 id 也归零重发，免得跟归档里的旧 id 撞上
+        nextHabitId = 1;
         save();
+    }
+
+    /**
+     * 打卡的唯一写入口：同时维护 days[] 与 mins[]，避免两处不同步。
+     * 补记历史日期时记 UNKNOWN（用户当时没在场，编个时间反而是假数据）。
+     */
+    public void mark(Habit h, int day, boolean on) {
+        if (h == null || day < 1 || day > 31) return;
+        h.days[day] = on;
+        if (!on) {
+            h.mins[day] = HabitTime.NONE;
+        } else if (day == dayOfMonth()) {
+            Calendar c = Calendar.getInstance();
+            h.mins[day] = HabitTime.encode(c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE));
+        } else {
+            h.mins[day] = HabitTime.UNKNOWN;
+        }
     }
 
     public void save() {
@@ -900,9 +1173,14 @@ public final class Store {
             for (Habit h : habits) {
                 JSONObject x = new JSONObject();
                 x.put("n", h.name); x.put("s", h.streak);
+                // 习惯 id：稳定标识，改名后历史仍跟得上
+                if (h.id == null || h.id.isEmpty()) h.id = newHabitId();
+                x.put("i", h.id);
                 StringBuilder b = new StringBuilder();
                 for (int i = 1; i <= 31; i++) b.append(h.days[i] ? '1' : '0');
                 x.put("b", b.toString());
+                // 打卡时刻：老版本没有这个键，读的时候按位串迁移
+                x.put("m", HabitTime.encodeArr(h.mins));
                 hs.put(x);
             }
             o.put("habits", hs);
@@ -910,12 +1188,13 @@ public final class Store {
             JSONArray ds = new JSONArray();
             for (Day d : days) {
                 JSONObject x = new JSONObject();
-                x.put("n", d.name); x.put("m", d.millis); x.put("p", d.pinned);
+                x.put("n", d.name); x.put("m", d.millis);
+                x.put("p", d.pinned); x.put("c", d.onClock);
                 ds.put(x);
             }
             o.put("days", ds);
 
-            p.edit()
+            android.content.SharedPreferences.Editor ed = p.edit()
                     .putString("data", o.toString())
                     .putBoolean("sec", showSeconds)
                     .putBoolean("h24", h24)
@@ -933,8 +1212,39 @@ public final class Store {
                     .putInt("par", pomoAllRounds)
                     .putInt("pam", pomoAllMinutes)
                     .putInt("hm", habitMonth)
-                    .apply();
+                    .putInt("hi", nextHabitId);
+            // 打卡归档：只在这个月真的翻过去时才写，避免每次打卡都重写一遍大字符串
+            if (habitArchDirty) {
+                ed.putString("ha", HabitArchive.encode(habitArch));
+                habitArchDirty = false;
+            }
+            ed.apply();
+            idDirty = false;
         } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 让 id 计数器超过现存的所有 id。
+     * 恢复备份后必须重算：备份里的习惯带着旧 id，计数器若停在 1，
+     * 新加的习惯就会拿到 h1，和老习惯撞上，历史会串。
+     */
+    private void syncNextHabitId() {
+        int max = 0;
+        for (Habit h : habits) max = Math.max(max, HabitIds.num(h.id));
+        for (HabitArchive.Month m : habitArch) {
+            for (HabitArchive.Entry e : m.entries) max = Math.max(max, HabitIds.num(e.id));
+        }
+        nextHabitId = Math.max(nextHabitId, max + 1);
+    }
+
+    /** 读回打卡归档。 */
+    private void loadHabitArch(String s) {
+        habitArch.clear();
+        try {
+            habitArch.addAll(HabitArchive.decode(s));
+        } catch (Exception ignored) {
+            habitArch.clear();
         }
     }
 }
